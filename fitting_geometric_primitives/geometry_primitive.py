@@ -1,10 +1,3 @@
-'''
-    TODO
-        + input f_id => v_id, do duplicate check
-        + pre compute vertex&face normal, face area, face center
-        + difference of fitting vertex and face
-'''
-
 # import scipy.optimize
 import sklearn.cluster
 import numpy as np
@@ -18,7 +11,7 @@ import scipy
 import sklearn
 from scipy.special import comb
 # mp.offline()
-# import open3d as o3d
+import open3d as o3d
 
 
 
@@ -63,17 +56,28 @@ def is_cylinder_same(cylinder1, cylinder2):
 
     return True
 
+def get_bbox_diagnal(points):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    bbox = pcd.get_axis_aligned_bounding_box()
+    min_bound = bbox.get_min_bound()
+    max_bound = bbox.get_max_bound()
+    diagnal = np.linalg.norm(max_bound - min_bound)
+    return diagnal
 
+
+# not need f
 class Plane:
     def __init__(self, v, f, f_normal, f_area, f_center):
         self.v = v
         self.f = f
-        self.f_normal = f_normal
-        self.f_area = f_area
-        self.f_center = f_center
+        if f is not None:
+            self.f_normal = f_normal
+            self.f_area = f_area
+            self.f_center = f_center
         
         self.threshold = 1e-2
-        
+
     def fit(self, id, is_v_id):
         if is_v_id:
             points = np.asarray(self.v[id])
@@ -81,13 +85,7 @@ class Plane:
             v_id = np.unique(self.f[id].flatten())
             points = np.asarray(self.v[v_id])
         
-        # pcd = o3d.geometry.PointCloud()
-        # pcd.points = o3d.utility.Vector3dVector(points)
-        # bbox = pcd.get_axis_aligned_bounding_box()
-        # min_bound = bbox.get_min_bound()
-        # max_bound = bbox.get_max_bound()
-        # diagnal = np.linalg.norm(max_bound - min_bound)
-        # self.threshold = 1e-2 * diagnal
+        
             
         centroid = np.mean(points, axis=0)
         centered_points = points - centroid
@@ -109,7 +107,7 @@ class Plane:
 
     
 
-
+# not need face
 class Sphere:
     def __init__(self, v, f, f_normal, f_area, f_center):
         self.v = v
@@ -315,8 +313,6 @@ class Extrusion:
             return 0, []
         
         return normal_plane_rate, normal_plane_param[:3].squeeze()
-
-
 
 
 
@@ -670,7 +666,7 @@ class Cone:
 #         # )
 #         return results.x[:3], results.x[3:], np.linalg.norm(results.x[3:]), minor_radius
         
-    
+# not need face  
 class Cylinder:
     def __init__(self, v, f, f_center, f_area, f_normal):
         self.v = v
@@ -681,9 +677,9 @@ class Cylinder:
         # self.f_normal = f_normal
         # self.f_normal = igl.per_face_normals(v, f, np.array([1., 0., 0.]))
         
-        self.n_sample_f_normal = 20
-        self.f_center = np.mean(v[f], axis=1)
-        self.f_area = igl.doublearea(v, f) / 2
+        # self.n_sample_f_normal = 20
+        # self.f_center = np.mean(v[f], axis=1)
+        # self.f_area = igl.doublearea(v, f) / 2
         self.f_normal = igl.per_face_normals(v, f, np.array([1., 0., 0.]))
         self.f_normal = self.f_normal / np.linalg.norm(self.f_normal, axis=1).reshape(-1, 1)
         self.v_normal = igl.per_vertex_normals(v, f)

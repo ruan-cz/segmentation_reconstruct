@@ -335,8 +335,7 @@ class PrimitiveFitting:
         # return cone.fit(f_id, is_v_id)
         return cone.fit_on_all_points(f_id, is_v_id)
         # return cone.fit_optimization(f_id, is_v_id)
-        
-        
+         
         
     def fit_torus(self, f_id, is_v_id = False):
         if is_v_id:
