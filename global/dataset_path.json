@@ -1,0 +1,10 @@
+{
+    "fusion360": {
+        "seg_total_path": "D:\\dataset\\fusion360gallery\\s2.0.1",
+        "obj_path": "D:\\dataset\\fusion360gallery\\s2.0.1\\meshes",
+        "obj_names": "D:\\dataset\\fusion360gallery\\s2.0.1\\obj_names.txt",
+        "raw_output_path": "D:\\dataset\\fusion360gallery\\s2.0.1\\ply_raw",
+        "seg_output_path": "D:\\dataset\\fusion360gallery\\s2.0.1\\ply_seg",
+        "segment_names": "D:\\dataset\\fusion360gallery\\s2.0.1\\segment_names.json"
+    }
+}

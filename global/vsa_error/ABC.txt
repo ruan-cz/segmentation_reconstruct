@@ -1,0 +1,4 @@
+00000002:
+    region 36: vsa -> cylinder 1.0
+    region 40: vsa -> cylinder 0.5 sphere 0.86
+    region 41: vsa/torus -> sphere 0.83
