@@ -13,7 +13,30 @@ from scipy.special import comb
 # mp.offline()
 import open3d as o3d
 
+from sklearn.neighbors import NearestNeighbors
 
+def estimate_normals(points, k=30):
+    nbrs = NearestNeighbors(n_neighbors=k, algorithm='kd_tree').fit(points)
+    _, indices = nbrs.kneighbors(points)
+
+    normals = np.zeros_like(points)
+
+    for i in range(points.shape[0]):
+        neighbors = points[indices[i]]
+
+        # center neighborhood
+        neighbors = neighbors - neighbors.mean(axis=0)
+
+        # covariance
+        cov = neighbors.T @ neighbors
+
+        # eigen decomposition
+        eigvals, eigvecs = np.linalg.eigh(cov)
+
+        # smallest eigenvector = normal
+        normals[i] = eigvecs[:, 0]
+
+    return normals
 
 def vector_same_direction(v1, v2):
     # v1, v2 = np.array(v1).reshape()
@@ -68,7 +91,7 @@ def get_bbox_diagnal(points):
 
 # not need f
 class Plane:
-    def __init__(self, v, f, f_normal, f_area, f_center):
+    def __init__(self, v, f=None, f_normal=None, f_area=None, f_center=None):
         self.v = v
         self.f = f
         if f is not None:
@@ -76,7 +99,7 @@ class Plane:
             self.f_area = f_area
             self.f_center = f_center
         
-        self.threshold = 1e-2
+        self.threshold = 1e-2 * get_bbox_diagnal(v)
 
     def fit(self, id, is_v_id):
         if is_v_id:
@@ -105,18 +128,18 @@ class Plane:
 
         return fit_rate, param
 
-    
+
 
 # not need face
 class Sphere:
-    def __init__(self, v, f, f_normal, f_area, f_center):
+    def __init__(self, v, f=None, f_normal=None, f_area=None, f_center=None):
         self.v = v
         self.f = f
         self.f_normal = f_normal
         self.f_area = f_area
         self.f_center = f_center
         
-        self.threshold = 1e-1
+        self.threshold = 1e-1 * get_bbox_diagnal(v)
 
     def optmize_fit(self, id, is_v_id):
         if is_v_id:
@@ -178,7 +201,7 @@ class Sphere:
             
         n_points = points.shape[0]
 
-        eps = 5*1e-2
+        eps = 10*1e-2
         sample_radio = 1e-1
         max_iter = 100
         
@@ -244,9 +267,6 @@ class Sphere:
         if len(best_center) == 0:
             return 0, np.array([0., 0., 0., 0.])
         
-        # if n_points == 648:
-        #     # write points into txt
-        #     np.savetxt('planar_points.txt', points, fmt='%.6f')
         
         best_params = np.array([
             best_center[0, 0], 
@@ -317,7 +337,7 @@ class Extrusion:
 
 
 class Cone:
-    def __init__(self, v, f):
+    def __init__(self, v, f=None):
         self.v = v
         self.f = f
         self.v_normal = igl.per_vertex_normals(v, f)
@@ -392,8 +412,11 @@ class Cone:
 
             vec = points - p
             dot = np.dot(vec, axis)
+            print(vec.shape, dot.shape, axis.shape)
             v_perp = vec - dot[:, np.newaxis] * axis
             r = np.linalg.norm(v_perp, axis=1)
+            
+            print()
             r_expected = dot * np.tan(theta)
             
             distances = np.abs(r - r_expected)
@@ -465,6 +488,8 @@ class Cone:
 
             vec = points - apex
             dot = np.dot(vec, axis)
+            print(vec.shape, dot.shape, axis.shape)
+            
             v_perp = vec - dot[:, np.newaxis] * axis
             r = np.linalg.norm(v_perp, axis=1)
             r_expected = dot * np.tan(theta)
@@ -668,10 +693,11 @@ class Cone:
         
 # not need face  
 class Cylinder:
-    def __init__(self, v, f, f_center, f_area, f_normal):
+    def __init__(self, v, f=None, f_center=None, f_area=None, f_normal=None):
         self.v = v
         self.f = f
         
+        self.v_normal = estimate_normals(v)
         # self.f_center = f_center
         # self.f_area = f_area
         # self.f_normal = f_normal
@@ -680,9 +706,9 @@ class Cylinder:
         # self.n_sample_f_normal = 20
         # self.f_center = np.mean(v[f], axis=1)
         # self.f_area = igl.doublearea(v, f) / 2
-        self.f_normal = igl.per_face_normals(v, f, np.array([1., 0., 0.]))
-        self.f_normal = self.f_normal / np.linalg.norm(self.f_normal, axis=1).reshape(-1, 1)
-        self.v_normal = igl.per_vertex_normals(v, f)
+        # self.f_normal = igl.per_face_normals(v, f, np.array([1., 0., 0.]))
+        # self.f_normal = self.f_normal / np.linalg.norm(self.f_normal, axis=1).reshape(-1, 1)
+        # self.v_normal = igl.per_vertex_normals(v, f)
         
         
     def fit(self, id, is_v_id, visualize=False):
@@ -1051,12 +1077,7 @@ class PointFittting:
         self.f_area = f_area
         self.f_normal = f_normal
         
-        
 
-
-'''
-    params \in R^10
-'''
 class QuadricSurface:
     def __init__(self):
         pass

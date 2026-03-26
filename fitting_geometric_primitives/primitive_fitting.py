@@ -13,27 +13,31 @@ import scipy
 import sklearn
 from scipy.special import comb
 
-from utils import *
-from fitting_geometric_primitives.geometry_primitive import *
+
+import utils
+from geometry_primitive import *
+
 
     
 class PrimitiveFitting:
-    def __init__(self, v, f, f_normal=None, f_center=None, f_area=None):
+    def __init__(self, v, f=None, f_normal=None, f_center=None, f_area=None):
         self.v = v
         self.f = f
         # self.f_normal = f_normal
         # self.f_center = f_center
         # self.f_area = f_area
-        self.v_normal = igl.per_vertex_normals(v, f)
+        # self.v_normal = igl.per_vertex_normals(v, f)
+        # self.v_normal = estimate_normals(v)
 
-        self.f_center = np.mean(v[f], axis=1)
-        self.f_area = igl.doublearea(v, f) / 2
-        self.f_normal = igl.per_face_normals(v, f, np.array([1., 0., 0.]))
-        self.f_normal = self.f_normal / np.linalg.norm(self.f_normal, axis=1).reshape(-1, 1)
+        # self.f_center = np.mean(v[f], axis=1)
+        # self.f_area = igl.doublearea(v, f) / 2
+        # self.f_normal = igl.per_face_normals(v, f, np.array([1., 0., 0.]))
+        # self.f_normal = self.f_normal / np.linalg.norm(self.f_normal, axis=1).reshape(-1, 1)
     
     
     def fit_planar(self, f_id, is_v_id = False):
-        plane = Plane(self.v, self.f, self.f_normal, self.f_area, self.f_center)
+        plane = Plane(self.v)
+        # plane = Plane(self.v, self.f, self.f_normal, self.f_area, self.f_center)
         return plane.fit(f_id, is_v_id)
         
         # if is_v_id:
@@ -66,7 +70,8 @@ class PrimitiveFitting:
     
     def fit_cylinder(self, f_id, is_v_id = False, visualize=False):
         
-        cylinder = Cylinder(self.v, self.f, self.f_normal, self.f_area, self.f_center)
+        cylinder = Cylinder(self.v)
+        # cylinder = Cylinder(self.v, self.f, self.f_normal, self.f_area, self.f_center)
         return cylinder.fit(f_id, is_v_id, visualize=False)
         
         if is_v_id:
@@ -291,7 +296,8 @@ class PrimitiveFitting:
         
 
     def fit_sphere(self, f_id, is_v_id = False):
-        sphere = Sphere(self.v, self.f, self.f_normal, self.f_area, self.f_center)
+        sphere = Sphere(self.v)
+        # sphere = Sphere(self.v, self.f, self.f_normal, self.f_area, self.f_center)
         # return sphere.optmize_fit(f_id, is_v_id)
         return sphere.fit(f_id, is_v_id)
         
@@ -331,10 +337,10 @@ class PrimitiveFitting:
         # return fit_rate, params
         
     def fit_cone(self, f_id, is_v_id = False):
-        cone = Cone(self.v, self.f)
+        cone = Cone(self.v)
         # return cone.fit(f_id, is_v_id)
-        return cone.fit_on_all_points(f_id, is_v_id)
-        # return cone.fit_optimization(f_id, is_v_id)
+        # return cone.fit_on_all_points(f_id, is_v_id)
+        return cone.fit_optimization(f_id, is_v_id)
          
         
     def fit_torus(self, f_id, is_v_id = False):
