@@ -1,0 +1,16 @@
+{
+    "path": "data/selected/00141162_94c6a611782528aee2eb3db5_trimesh_000.obj",
+    "out_dir": "out/raw_voronoi",
+    "epsilon": 0.08,
+    "radius_thr": 0.04,
+    "angle_thr": 30.0,
+    "sigma": 5.0,
+    "num_patches": -1,
+    "num_neighbors": 100,
+    "num_smooth_iter": 50,
+    "num_sor_iter": 2,
+    "num_sor_neighbors": 50,
+    "num_sor_std_ratio": 0.8,
+    "num_threads": 8,
+    "lambda": 0.5
+}

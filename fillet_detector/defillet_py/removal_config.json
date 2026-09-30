@@ -1,0 +1,11 @@
+{
+  "path": "DeFillet/data/seal.ply",
+  "label_path": "out/seal_detector_TIMESTAMP/seal_seg.json",
+  "out_dir": "out",
+  "angle_thr": 30.0,
+  "beta_e": 2.0,
+  "beta_f": 1.0,
+  "beta_c": 1.0,
+  "num_opt_iter": 15,
+  "num_threads": -1
+}

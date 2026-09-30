@@ -1,0 +1,2 @@
+[console_scripts]
+defillet = defillet_py.cli:main
