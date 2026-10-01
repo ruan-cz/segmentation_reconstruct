@@ -461,9 +461,10 @@ def render_transparent_mesh_vtk(v, f, output_path, e=None,
     
 
 if __name__ == '__main__':
-    v, f = igl.read_triangle_mesh("/Users/ruan/Desktop/MeshSegment/example_data/example_CAD/2.obj")
-    proxy2f = read_patch_cluster("/Users/ruan/Desktop/MeshSegment/example_results/vsa/2_merged_proxy_cluster.txt")
-    color500_file = "/Users/ruan/Desktop/MeshSegment/utils/colors_500.txt"
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    v, f = igl.read_triangle_mesh(os.path.join(repo_root, "example_data/example_CAD/2.obj"))
+    proxy2f = read_patch_cluster(os.path.join(repo_root, "example_results/vsa/2_merged_proxy_cluster.txt"))
+    color500_file = os.path.join(repo_root, "utils/colors_500.txt")
     file = open(color500_file, 'r')
     lines = file.readlines()
     colors = np.zeros((len(lines),3))

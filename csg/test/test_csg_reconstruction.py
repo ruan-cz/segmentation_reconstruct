@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import trimesh
 
 from csg.graph_construct import prepare_patch_graph
@@ -26,6 +27,12 @@ from csg.csg_reconstruction import (
     primitive_contains,
     reconstruct_csg_tree,
 )
+
+
+def _prepare_example_graph(ply_path):
+    if not Path(ply_path).is_file():
+        pytest.skip(f"example data not available: {ply_path}")
+    return prepare_patch_graph(ply_path)
 
 
 def _rotated_box_patches(rotated=True):
@@ -126,7 +133,7 @@ def test_axis_aligned_multi_cube_partition_regression():
         "example_data/final/ply/"
         "00140750_0da4d13f288d4cd70deecf20_trimesh_001/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
 
     candidates = generate_cube_candidates(results, graph)
     partition = {frozenset(candidate.patch_ids) for candidate in candidates}
@@ -147,7 +154,7 @@ def test_00023435_classifies_inner_cube_as_subtract():
         "example_data/final/ply/"
         "00023435_385b221a0d58490b84f3edee_trimesh_000/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_cube_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -172,7 +179,7 @@ def test_00024448_rejects_degenerate_large_spheres():
         "example_data/final/ply/"
         "00024448_274a7c9d6def4a699961a747_trimesh_002/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
 
     assert not [
@@ -192,7 +199,7 @@ def test_00025710_keeps_both_subtractive_cylinders():
         "example_data/final/ply/"
         "00025710_6fe81cf35e2740b3bbde9aa6_trimesh_020/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -221,7 +228,7 @@ def test_00023471_classifies_cylinder_inside_additive_union_as_subtract():
         "example_data/final/ply/"
         "00023471_7f45ff9e8c754def8bb4b1cb_trimesh_000/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -250,7 +257,7 @@ def test_00023792_preserves_additive_inner_cylinders():
         "example_data/final/ply/"
         "00023792_30c31f050d2c40139e9b36ca_trimesh_001/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -292,7 +299,7 @@ def test_00025611_groups_disconnected_sphere_and_preserves_torus_csg():
         "example_data/final/ply/"
         "00025611_37f3a717a9b842cfbe5f6005_trimesh_002/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -368,7 +375,7 @@ def test_00023582_selects_polygonal_extrusion_candidate():
         "example_data/final/ply/"
         "00023582_9c917172a61b472fb0e6ae3c_trimesh_002/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -399,7 +406,7 @@ def test_00024792_screw_threads_and_cross_recess():
         "example_data/final/ply/"
         "00024792_34a17822747a4b20a8c2954b_trimesh_009/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -458,7 +465,7 @@ def test_00140553_recovers_beam_between_rotated_arms():
     ply_path = Path(
         "example_data/final/ply/00140553_e2c0841b6c86e3bfdcc8c477_trimesh_000/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
     csg_ir, selected, report = reconstruct_csg_tree(candidates, results)
@@ -505,7 +512,7 @@ def test_00025728_cylinder_with_chord_notch():
         "example_data/final/ply/"
         "00025728_6fe81cf35e2740b3bbde9aa6_trimesh_038/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -542,7 +549,7 @@ def test_00025183_cube_with_bosses_and_through_slot():
         "example_data/final/ply/"
         "00025183_021c990acfc648618a49bd47_trimesh_000/gt.ply"
     )
-    _, _, results, graph = prepare_patch_graph(ply_path)
+    _, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 

@@ -6,6 +6,7 @@ import networkx as nx
 import trimesh
 from collections import defaultdict
 from collections import Counter
+from pathlib import Path
 import time
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
@@ -24,7 +25,7 @@ from cutting.cut import *
 from cutting.graph_cut import *
 
 # read colors from file
-file = open('utils/colors_500.txt', 'r')
+file = open(Path(__file__).resolve().parent.parent / 'utils' / 'colors_500.txt', 'r')
 lines = file.readlines()
 colors = np.zeros((len(lines),3))
 for i in range(len(lines)):

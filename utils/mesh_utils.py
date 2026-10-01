@@ -12,12 +12,13 @@ import igl
 import networkx as nx
 import trimesh
 from collections import defaultdict
+from pathlib import Path
 from geometry.geometry_process import *
 
 
 
 # read colors from file
-file = open('utils/colors_500.txt', 'r')
+file = open(Path(__file__).resolve().parent / 'colors_500.txt', 'r')
 lines = file.readlines()
 colors = np.zeros((len(lines),3))
 for i in range(len(lines)):

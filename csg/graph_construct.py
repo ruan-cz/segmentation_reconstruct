@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-from primitive_fitting import PrimitiveFitting
+from primitive_fitting.fitting import PrimitiveFitting
 
 
 def _load_triangle_mesh(mesh_or_path):
@@ -193,7 +193,7 @@ def fit_patch_primitives(
     if include_extrusion:
         methods["extrusion"] = fitter.fit_extrusion
     if include_spline_extrusion:
-        methods["spline_extrusion"] = fitter.fit_spline_extrusion
+        methods["spline_extrusion"] = fitter.fit_extrusion
 
     fits = {}
     for primitive_type, method in methods.items():
@@ -429,9 +429,12 @@ def prepare_patch_graph(
     return mesh, patches, results, patch_graph
 
 
-def load_colormap(path="global/colors_500.txt"):
+_DEFAULT_COLORMAP = Path(__file__).resolve().parent.parent / "utils" / "colors_500.txt"
+
+
+def load_colormap(path=None):
     """Load an RGB text colormap used for notebook visualization."""
-    colors = np.asarray(np.loadtxt(path, dtype=float), dtype=float)
+    colors = np.asarray(np.loadtxt(_DEFAULT_COLORMAP if path is None else path, dtype=float), dtype=float)
     if colors.ndim != 2 or colors.shape[1] != 3 or len(colors) == 0:
         raise ValueError("colormap must be a non-empty N x 3 array")
     return colors

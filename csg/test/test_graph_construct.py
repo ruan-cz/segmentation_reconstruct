@@ -128,6 +128,9 @@ def test_prepare_patch_graph_handles_single_degenerate_face():
         "00140553_e2c0841b6c86e3bfdcc8c477_trimesh_000/gt.ply"
     )
 
+    if not ply_path.is_file():
+        pytest.skip(f"example data not available: {ply_path}")
+
     _, patches, results, _ = graph_construct.prepare_patch_graph(ply_path)
 
     assert len(patches) == len(results)
