@@ -522,6 +522,119 @@ def _build_additive_ir(candidate_nodes, results, coverage_threshold):
     return terms[0] if len(terms) == 1 else {"op": "UNION", "children": terms}
 
 
+def _stitch_pocket_cutters(candidates, nodes, model_scale):
+    """Close gaps between a pocket floor cutter and its adjacent groove prisms.
+
+    A groove profile can taper inward as it rises, while its central floor
+    cutter has a fixed footprint. Extend only the inner side of selected
+    adjacent subtractive prisms to the floor cutter's face, with a tiny
+    overlap for robust Boolean evaluation. Their outer observed profiles
+    remain unchanged.
+    """
+    overlap = max(1e-4 * model_scale, 1e-8)
+    seam_tolerance = max(1e-3 * model_scale, 1e-7)
+    for pocket in candidates:
+        if not pocket.metadata.get("pocket_floor") or pocket.primitive_type != "CUBE":
+            continue
+        connected = {
+            tuple(patch_ids) for patch_ids in pocket.metadata.get("connected_prisms", [])
+        }
+        if not connected:
+            continue
+        rotation = np.asarray(pocket.parameters["rotation"], dtype=float)
+        normal_axis = int(np.argmax(np.abs(rotation[:, 2])))
+        if abs(rotation[normal_axis, 2]) < 0.999:
+            continue
+        pocket_bounds = candidate_module.primitive_bounds(pocket)
+        for prism, node in zip(candidates, nodes):
+            if prism.primitive_type != "EXTRUSION" or tuple(prism.patch_ids) not in connected:
+                continue
+            parameters = prism.parameters
+            axis = np.asarray(parameters["axis"], dtype=float)
+            axial_axis = int(np.argmax(np.abs(axis)))
+            if axial_axis == normal_axis or abs(axis[axial_axis]) < 0.999:
+                continue
+            radial_axis = next(index for index in range(3) if index not in {normal_axis, axial_axis})
+            bounds = candidate_module.primitive_bounds(prism)
+            if (
+                bounds[1, normal_axis] < pocket_bounds[0, normal_axis]
+                or bounds[0, normal_axis] > pocket_bounds[1, normal_axis]
+                or bounds[1, axial_axis] < pocket_bounds[0, axial_axis]
+                or bounds[0, axial_axis] > pocket_bounds[1, axial_axis]
+            ):
+                continue
+            if abs(bounds[0, radial_axis] - pocket_bounds[1, radial_axis]) <= seam_tolerance:
+                wall = pocket_bounds[1, radial_axis] - overlap
+            elif abs(bounds[1, radial_axis] - pocket_bounds[0, radial_axis]) <= seam_tolerance:
+                wall = pocket_bounds[0, radial_axis] + overlap
+            else:
+                continue
+            origin = np.asarray(parameters["axis_point"], dtype=float)
+            basis = np.asarray(parameters["basis"], dtype=float)
+            polygon = np.asarray(parameters["polygon"], dtype=float)
+            extra = []
+            for station in bounds[:, normal_axis]:
+                point = origin.copy()
+                point[radial_axis] = wall
+                point[normal_axis] = station
+                extra.append((point - origin) @ basis)
+            extended = np.vstack([polygon, extra])
+            if np.max(np.linalg.norm(extended[-2:, None] - polygon[None, :], axis=2).min(axis=1)) > 0.1 * model_scale:
+                continue
+            hull = scipy.spatial.ConvexHull(extended)
+            node["parameters"]["polygon"] = extended[hull.vertices].tolist()
+
+
+def _overlap_coaxial_cutters(candidates, nodes, model_scale):
+    """Give touching stepped-hole cutters a small shared axial interval."""
+    overlap = max(1e-5 * model_scale, 1e-8)
+    seam_tolerance = max(1e-4 * model_scale, 1e-7)
+    cylinders = [
+        (candidate, node)
+        for candidate, node in zip(candidates, nodes)
+        if candidate.primitive_type == "CYLINDER"
+    ]
+    for index, (first, first_node) in enumerate(cylinders):
+        first_parameters = first_node["parameters"]
+        first_axis = candidate_module._normalize(first_parameters["axis"])
+        first_origin = np.asarray(first_parameters["axis_point"], dtype=float)
+        if first_axis is None:
+            continue
+        for second, second_node in cylinders[index + 1 :]:
+            second_parameters = second_node["parameters"]
+            second_axis = candidate_module._normalize(second_parameters["axis"])
+            second_origin = np.asarray(second_parameters["axis_point"], dtype=float)
+            if (
+                second_axis is None
+                or abs(float(np.dot(first_axis, second_axis))) < np.cos(np.deg2rad(1.0))
+                or np.linalg.norm(np.cross(second_origin - first_origin, first_axis))
+                > seam_tolerance
+            ):
+                continue
+            first_extent = np.asarray(first_parameters["extent"], dtype=float)
+            second_extent = np.asarray(second_parameters["extent"], dtype=float)
+            first_stations = (first_origin @ first_axis) + first_extent
+            second_stations = (second_origin @ first_axis) + second_extent * np.dot(
+                second_axis, first_axis
+            )
+            first_low, first_high = float(first_stations.min()), float(first_stations.max())
+            second_low, second_high = float(second_stations.min()), float(second_stations.max())
+            if abs(first_high - second_low) <= seam_tolerance:
+                first_end = int(np.argmax(first_stations))
+                second_end = int(np.argmin(second_stations))
+                first_extent[first_end] += overlap
+                second_extent[second_end] -= overlap / float(np.dot(second_axis, first_axis))
+            elif abs(second_high - first_low) <= seam_tolerance:
+                first_end = int(np.argmin(first_stations))
+                second_end = int(np.argmax(second_stations))
+                first_extent[first_end] -= overlap
+                second_extent[second_end] += overlap / float(np.dot(second_axis, first_axis))
+            else:
+                continue
+            first_parameters["extent"] = first_extent.tolist()
+            second_parameters["extent"] = second_extent.tolist()
+
+
 def build_csg_ir(
     selected_candidates,
     results=None,
@@ -637,6 +750,11 @@ def build_csg_ir(
             if not restorative
             else {"op": "UNION", "children": [base, *restorative]}
         )
+    if results is not None:
+        points = np.vstack([np.asarray(result["mesh"].vertices, dtype=float) for result in results])
+        model_scale = max(float(np.linalg.norm(np.ptp(points, axis=0))), candidate_module.EPSILON)
+        _stitch_pocket_cutters(subtractive_candidates, subtractive, model_scale)
+        _overlap_coaxial_cutters(subtractive_candidates, subtractive, model_scale)
     subtraction = (
         subtractive[0]
         if len(subtractive) == 1

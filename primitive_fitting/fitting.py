@@ -37,7 +37,9 @@ class PrimitiveFitting:
         if self.f.ndim != 2 or self.f.shape[1] != 3:
             raise ValueError("f must have shape (m, 3)")
 
-        self.v_normal = _normalized_rows(igl.per_vertex_normals(self.v, self.f))
+        self.v_normal = _normalized_rows(
+            np.asarray(igl.per_vertex_normals(self.v, self.f)).reshape((-1, 3))
+        )
         self.f_center = (
             np.mean(self.v[self.f], axis=1)
             if f_center is None
@@ -48,12 +50,15 @@ class PrimitiveFitting:
             if f_area is None
             else np.asarray(f_area, dtype=float)
         )
+        self.f_area = np.asarray(self.f_area, dtype=float).reshape(-1)
         self.f_normal = (
             igl.per_face_normals(self.v, self.f, np.array([1.0, 0.0, 0.0]))
             if f_normal is None
             else np.asarray(f_normal, dtype=float)
         )
-        self.f_normal = _normalized_rows(self.f_normal)
+        self.f_normal = _normalized_rows(
+            np.asarray(self.f_normal).reshape((-1, 3))
+        )
 
         if self.f_center.shape != (len(self.f), 3):
             raise ValueError("f_center must have shape (m, 3)")

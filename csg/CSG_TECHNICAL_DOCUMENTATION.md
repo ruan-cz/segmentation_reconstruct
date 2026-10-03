@@ -1,7 +1,7 @@
 # MeshSegment CSG 重建技术文档
 
 > 本文档描述当前 CSG 重建部分的完整技术流程：从分割后的三角网格（segmented PLY）出发，到最终生成 OpenSCAD 文件的每一步所采用的算法与技术。
-> 依据 2026-09 当前代码核实整理（`csg/graph_construct.py`、`primitive_fitting.py`、`fitting_geometric_primitives/geometry_primitive.py`、`csg/csg_core/`、`csg/csg_reconstruction.py`、`csg_process.ipynb`）。
+> 依据当前代码核实整理（`csg/graph_construct.py`、`primitive_fitting/fitting.py`、`primitive_fitting/geometry_primitive.py`、`csg/csg_core/`、`csg/csg_reconstruction.py`、`csg_process.ipynb`）。
 > 较旧的 `CSG_RECONSTRUCTION_PROJECT_SUMMARY.md` 未覆盖 spline extrusion、transition patch 等较新功能，本文档为准。
 
 ---
@@ -63,7 +63,7 @@ segmented PLY（面片带 RGB segment 颜色）
 
 ## 3. Step 2：单 patch primitive 初步拟合
 
-**文件：`csg/graph_construct.py`（`fit_patch_primitives` / `identify_patches`）、`primitive_fitting.py`、`fitting_geometric_primitives/geometry_primitive.py`**
+**文件：`csg/graph_construct.py`（`fit_patch_primitives` / `identify_patches`）、`primitive_fitting/fitting.py`、`primitive_fitting/geometry_primitive.py`**
 
 这一步回答的问题是："单个 patch 是否接近某种解析曲面？"——注意它与后续 candidate 阶段"哪些 patch 应组合成同一个完整实体"是两层不同职责。
 
@@ -75,6 +75,7 @@ segmented PLY（面片带 RGB segment 颜色）
 - `igl.doublearea / 2.0`：面片面积；
 - `igl.per_face_normals`：面片法向（零长度法向用 `np.divide(..., where=...)` 安全归一化，避免退化面导致崩溃）；
 - 面片中心由 `np.mean(v[f], axis=1)` 计算。
+- 单面 patch 的 libigl 法向及面积输出会显式整形为 `(n, 3)` 与 `(n,)`，避免对一维法向执行 `axis=1` 运算时报错。
 
 ### 3.2 各类型底层拟合器
 
@@ -85,7 +86,7 @@ segmented PLY（面片带 RGB segment 颜色）
 | plane | `Plane.fit` | 协方差 PCA（`np.linalg.eig`）求法向，参数 `[a,b,c,d]` | 点到平面距离 < 1e-2 |
 | cylinder | `Cylinder.fit` | 轴假设来自点集 PCA 最小特征向量 + 法向外积矩阵 `Σnnᵀ` 的 `eigh` 最小特征向量；投影到 2D 后用 **Taubin 代数圆拟合**（`scipy.linalg.eig` 广义特征值） | `|dist − r| < 1%·r` |
 | sphere | `Sphere.fit` | <100 点直接 `lstsq`；≥100 点用 **RANSAC**（100 次迭代、每次采 10% 点） | 相对阈值 `5e-2·r`；半径 > 2×bbox 对角线判失败 |
-| cone | `Cone.fit_on_all_points` | 先用法向方程 `n·(p−apex)=0` 对所有点 `lstsq` 解顶点；再对 (axis, θ) 做 `scipy.optimize.minimize` **SLSQP**（约束 ‖axis‖=1） | 1e-2 |
+| cone | `Cone.fit_on_all_points` | 先用法向方程 `n·(p−apex)=0` 对所有点 `lstsq` 解顶点；再对 (apex, axis, θ) 做带 `soft_l1` 损失的 `scipy.optimize.least_squares`，单位轴约束作为残差惩罚项 | 1e-2 |
 | extrusion | `Extrusion.fit` | 将面法向拟合到 Gauss 球面上的一个平面（协方差 eig），要求覆盖率 > 0.9，返回 3 维轴向量 | 5e-2 |
 | spline_extrusion | 复用 `Extrusion.fit` | 当前与 extrusion 同实现；真实样条轮廓在 candidate 阶段由边界环恢复 | 同 extrusion |
 
@@ -223,7 +224,7 @@ plane 法向聚类 → 局部正交坐标系假设 → plane 表面转换到局�
 |---|---|---|---|
 | cylinder | 法向矩阵最小特征向量定轴；2D 投影 + 线性最小二乘拟合圆 | axis point、axis、radius（7 参数，max_nfev=400） | 点投影到轴得有限 extent |
 | sphere | 线性 `lstsq` 解球心半径 | center、radius（max_nfev=300） | 见下方过滤 |
-| cone | 法向切平面方程 `lstsq` 估计 apex；点协方差特征向量 × 两符号作轴假设；radial/axial 中位数 arctan 定初始角（clip [1°, 80°]） | apex、axis、angle（max_nfev=500，角界 [0.5°, 85°]） | 对 apex 反方向的点加 penalty |
+| cone | 法向切平面方程 `lstsq` 估计 apex；点协方差的 3 个特征轴经轴向中位数确定符号；radial/axial 中位数 arctan 定初始角（clip [1°, 80°]） | apex、axis、angle（max_nfev=500，角界 [0.5°, 85°]） | 对 apex 反方向的点加 penalty；轴向中位数恰为 0 时保留两个符号假设 |
 | torus | 点协方差 + 法向协方差共 6 个轴假设；轴向/径向分解初始化 major/minor | center、axis、major/minor radius（max_nfev=600） | 要求 major > 1.05·minor 过滤退化 |
 
 **Sphere 过滤**（两道）：
@@ -404,10 +405,10 @@ EMPTY:         false
 
 1. 取 target bounds 与 CSG bounds 的联合范围计算 pitch，体素数超限时按 `pitch *= 1.1` 循环放大；
 2. 在体素中心调用 `csg_contains()` 得 CSG occupancy；
-3. 目标 occupancy 用 `target_mesh.contains()`，失败时 fallback 到 `target_mesh.voxelized(pitch).fill().is_filled`；
+3. 对封闭目标网格，按 XY 列发射一条 Z 向射线，依据各列交点的奇偶性填充全部体素中心；只有出现奇数交点的退化列使用 `target_mesh.contains()`。开放网格或射线计算失败时使用 `target_mesh.voxelized(pitch).fill().is_filled`；
 4. 输出 `voxel_iou`、`missing_volume_ratio`、`extra_volume_ratio`、`volume_consistency`、`voxel_pitch`。
 
-这些指标目前主要用于结果报告与人工比较，尚未进入 beam search 的目标函数。
+这些指标目前主要用于结果报告与人工比较，尚未进入 beam search 的目标函数。按列求交与逐点 `contains` 在交线/边界退化处可能有小幅差异，因而体素指标仍是近似值；CSG IR 和 OpenSCAD 输出不受此验证实现影响。
 
 ---
 
@@ -466,7 +467,7 @@ validation_report = validate_csg(
 openscad_source = csg_to_openscad(csg_ir)
 ```
 
-可配置项：输入模型 `ply_path`、最小 patch 面数 `min_patch_faces`、是否启用 torus、是否运行 voxel validation、是否打印/可视化 patch（`plot_patch_graph` 依赖可选包 meshplot）、是否导出 `.scad`（默认 False，输出到 `example_results/<model>.scad`）。
+可配置项：输入模型 `ply_path`、最小 patch 面数 `min_patch_faces`、是否启用 torus、是否运行 voxel validation、是否打印/可视化 patch（`plot_patch_graph` 依赖可选包 meshplot）、是否导出 `.scad`（默认 False，输出到 `example_results/<model>.scad`）。Notebook 默认选中 `00023435_.../gt.ply`，关闭打印与可视化；切换输入时应保持恰好一条实际路径，而不是将列表全部注释（此时 `Path()` 会指向目录 `.`）。
 
 ---
 
@@ -518,6 +519,21 @@ PrimitiveCandidate(
 
 ---
 
-## 14. 备注：与 CSG 无关的相邻代码
+## 14. 速度与失败分析（2026-10）
+
+### 14.1 已处理的耗时点
+
+- 原体素验证对最多 180000 个体素中心分别调用 `trimesh.contains()`，内部是三角形射线求交；在 `00023435_...`（约 3.2 万面）上，主体重建不足 1 秒，验证却持续几十秒。当前实现按 XY 列查询交点，验证约 0.24 秒。对该模型随机抽取的 2000 个网格中心，按列结果与逐点 `contains` 一致率约 98.8%；此差异只影响报告中的近似体素指标。
+- `Cone.fit_on_all_points()` 的残差函数曾在每次数值雅可比评估时重新计算整个 patch 的尺度。现将该不随优化参数变化的量预计算一次，保留原损失函数。
+- 候选级 `fit_cone()` 原对每个 PCA 轴的两个符号各运行一次优化，但轴向中位数符号校正使两次起点通常完全相同。现只保留不同起点；中位数恰为 0 时仍保留两个符号。`00024792_...` 的候选生成约从 17.4 秒降到 10.3 秒。
+- 单面 patch 上 libigl 返回的一维法向/标量面积曾导致 `AxisError`，现显式整形。Notebook 的输入路径全被注释也会直接触发路径错误，现已提供有效默认路径。
+
+### 14.2 仍然会慢或重建不佳的场景
+
+`00024792_...` 含 66 个 patch：实测预处理约 12 秒，候选生成约 10 秒，验证约 1 秒。逐 patch 的 cone 拟合及多组 curved candidate 的非线性最小二乘仍是主要计算量；在无 GPU 的 CPU 环境下，大量窄小曲面 patch 会放大此成本。这个样例选择 55 个 primitive，`patch_coverage=1.0` 但 `search_score≈−0.228`，说明覆盖率优先的 beam search 可以用许多局部 primitive 拼满面片，却无法保证简洁的 CAD 结构。高体素 IoU 也不能单独证明拓扑和参数关系正确。
+
+回归测试目前仍有四处已存在或单面修复后暴露的几何期望差异：`00025611` 的 torus 候选、`00023582` 的 extrusion 最终选择、`00140553` 的第四个 cube，以及 `00025183` 的覆盖率阈值。后三项使用修改前的 candidate cone 拟合也能复现；这些属于候选/搜索质量问题，不能靠体素验证加速来修复。一般失败还可能来自分割面跨 primitive、凹形轮廓被凸包填平、过渡面被错误归类，以及仅按 patch coverage 搜索而未优化几何一致性。
+
+## 15. 备注：与 CSG 无关的相邻代码
 
 `cut.py`、`cut/close_cut.py`、`cut_calculate/` 属于另一条更早期的 mesh cutting/分割流水线（networkx 图切分、切割曲面求交等），CSG 流程（`csg_process.ipynb`、`csg/csg_core/`）对其无任何 import；其中 `cut/close_cut.py` 目前基本是 TODO 骨架。

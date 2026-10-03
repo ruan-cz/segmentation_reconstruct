@@ -26,6 +26,7 @@ from csg.csg_reconstruction import (
     generate_spline_extrusion_candidates,
     primitive_contains,
     reconstruct_csg_tree,
+    validate_csg,
 )
 
 
@@ -406,7 +407,7 @@ def test_00024792_screw_threads_and_cross_recess():
         "example_data/final/ply/"
         "00024792_34a17822747a4b20a8c2954b_trimesh_009/gt.ply"
     )
-    _, _, results, graph = _prepare_example_graph(ply_path)
+    mesh, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
     classify_boolean_operations(candidates, results)
 
@@ -459,6 +460,34 @@ def test_00024792_screw_threads_and_cross_recess():
         ]
     )
     assert list(csg_contains(csg_ir, probes)) == [False, False, True, True]
+    # The tapered groove walls must meet the central pocket at every height;
+    # otherwise a thin ring of material survives between the two cutters.
+    seam_probes = np.array([[0.0, 0.02, 0.35], [0.02, 0.0, 0.35]])
+    assert not np.any(csg_contains(csg_ir, seam_probes))
+    assert validate_csg(csg_ir, selected, results, target_mesh=mesh)["voxel_iou"] > 0.99
+
+
+def test_00023582_recovers_inward_round_without_false_chamfer():
+    ply_path = Path(
+        "example_data/final/ply/"
+        "00023582_9c917172a61b472fb0e6ae3c_trimesh_002/gt.ply"
+    )
+    mesh, _, results, graph = _prepare_example_graph(ply_path)
+    candidates = generate_primitive_candidates(results, graph)
+    assert results[9]["feature_type"] == "SURFACE"
+    classify_boolean_operations(candidates, results)
+
+    csg_ir, selected, _ = reconstruct_csg_tree(candidates, results)
+    assert any(
+        candidate.primitive_type == "INNER_TORUS"
+        and candidate.operation == "ADD"
+        and candidate.patch_ids == [24]
+        for candidate in selected
+    )
+    report = validate_csg(csg_ir, selected, results, target_mesh=mesh)
+    assert report["surface_coverage"] > 0.99
+    assert report["voxel_iou"] > 0.99
+    assert "rotate_extrude" in csg_to_openscad(csg_ir)
 
 
 def test_00140553_recovers_beam_between_rotated_arms():

@@ -52,6 +52,50 @@ def csg_contains(node, points):
     return candidate_module.primitive_contains(operation, node["parameters"], points)
 
 
+def _mesh_contains_grid(target_mesh, axes, pitch):
+    """Classify grid centers with one ray per XY column instead of per voxel."""
+    shape = tuple(len(axis) for axis in axes)
+    xy = np.stack(np.meshgrid(axes[0], axes[1], indexing="ij"), axis=-1).reshape(-1, 2)
+    occupancy = np.zeros((len(xy), shape[2]), dtype=bool)
+    bounds = target_mesh.bounds
+    in_bounds = np.all((xy >= bounds[0, :2]) & (xy <= bounds[1, :2]), axis=1)
+    ray_columns = np.flatnonzero(in_bounds)
+    if not len(ray_columns):
+        return occupancy.reshape(-1)
+
+    origins = np.column_stack(
+        (xy[ray_columns], np.full(len(ray_columns), bounds[0, 2] - pitch))
+    )
+    directions = np.tile([0.0, 0.0, 1.0], (len(origins), 1))
+    locations, ray_indices, _ = target_mesh.ray.intersects_location(
+        origins, directions, multiple_hits=True
+    )
+    if not len(ray_indices):
+        return occupancy.reshape(-1)
+    order = np.lexsort((locations[:, 2], ray_indices))
+    heights = locations[order, 2]
+    ray_indices = ray_indices[order]
+    indices, starts, counts = np.unique(
+        ray_indices, return_index=True, return_counts=True
+    )
+    for ray_index, start, count in zip(indices, starts, counts):
+        crossings = heights[start : start + count]
+        crossings = crossings[np.r_[True, np.diff(crossings) > pitch * 1e-6]]
+        # A closed mesh has an even number of crossings. A grazing ray may
+        # touch an edge or vertex; check only those ambiguous columns exactly.
+        column = ray_columns[ray_index]
+        if len(crossings) % 2:
+            column_points = np.column_stack(
+                (np.repeat(xy[column][None, :], shape[2], axis=0), axes[2])
+            )
+            occupancy[column] = target_mesh.contains(column_points)
+        else:
+            occupancy[column] = np.searchsorted(
+                crossings, axes[2], side="right"
+            ) % 2 == 1
+    return occupancy.reshape(-1)
+
+
 def validate_csg(
     csg_ir,
     selected_candidates,
@@ -110,8 +154,12 @@ def validate_csg(
     grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
     predicted = csg_contains(csg_ir, grid)
     try:
-        target = target_mesh.contains(grid)
+        if not target_mesh.is_watertight:
+            raise ValueError("open mesh requires voxel occupancy")
+        target = _mesh_contains_grid(target_mesh, axes, pitch)
     except Exception:
+        # Preserve the previous validation fallback for ray backends that
+        # cannot process a particular mesh or degenerate column.
         voxel_grid = target_mesh.voxelized(pitch).fill()
         target = voxel_grid.is_filled(grid)
     intersection = np.count_nonzero(predicted & target)

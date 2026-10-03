@@ -59,6 +59,30 @@ def csg_to_openscad(node, indent=0):
         )
         return f"{padding}{name}() {{\n{body}\n{padding}}}"
     parameters = node["parameters"]
+    if operation == "INNER_TORUS":
+        # The concave round is the material inside a short cylinder after
+        # removing the torus tube that defines its visible surface.
+        cylinder = {
+            "op": "CYLINDER",
+            "parameters": {
+                "axis_point": parameters["center"],
+                "axis": parameters["axis"],
+                "extent": parameters["extent"],
+                "radius": parameters["major_radius"],
+            },
+        }
+        torus = {
+            "op": "TORUS",
+            "parameters": {
+                "center": parameters["center"],
+                "axis": parameters["axis"],
+                "major_radius": parameters["major_radius"],
+                "minor_radius": parameters["minor_radius"],
+            },
+        }
+        return csg_to_openscad(
+            {"op": "DIFFERENCE", "children": [cylinder, torus]}, indent=indent
+        )
     if operation == "CUBE":
         center = _format_vector(parameters["center"])
         angles = _format_vector(parameters["euler_xyz_degrees"])

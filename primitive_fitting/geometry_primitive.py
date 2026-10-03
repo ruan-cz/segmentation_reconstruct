@@ -484,6 +484,7 @@ class Cone:
             return _failure(7)
 
         tolerance = _distance_tolerance(points, self.threshold)
+        penalty_scale = max(_characteristic_scale(points), 1.0)
 
         def residual(params):
             candidate_apex = params[:3]
@@ -495,9 +496,7 @@ class Cone:
             axial = q @ candidate_axis
             radial = np.linalg.norm(q - np.outer(axial, candidate_axis), axis=1)
             geometric = (radial - axial * np.tan(candidate_theta)) * np.cos(candidate_theta)
-            unit_penalty = (np.linalg.norm(params[3:6]) - 1.0) * max(
-                _characteristic_scale(points), 1.0
-            )
+            unit_penalty = (np.linalg.norm(params[3:6]) - 1.0) * penalty_scale
             return np.r_[geometric, unit_penalty]
 
         initial = np.r_[apex, axis, theta]

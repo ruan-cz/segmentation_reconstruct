@@ -1180,43 +1180,50 @@ def fit_cone(points, normals=None):
     candidate_axes = [vectors[:, index] for index in range(3)]
     best = None
     scale = max(np.linalg.norm(np.ptp(points, axis=0)), EPSILON)
+    # With a zero median axial coordinate the two signs are genuinely
+    # distinct initializations; otherwise the sign correction makes them equal.
+    candidate_axes.extend(
+        -axis for axis in list(candidate_axes)
+        if np.median((points - apex) @ axis) == 0.0
+    )
     for initial_axis in candidate_axes:
-        for direction_sign in (-1.0, 1.0):
-            axis = initial_axis * direction_sign
-            axial = (points - apex) @ axis
-            if np.median(axial) < 0:
-                axis = -axis
-                axial = -axial
-            radial = np.linalg.norm((points - apex) - axial[:, None] * axis, axis=1)
-            positive = axial > scale * 1e-6
-            if np.count_nonzero(positive) < 3:
-                continue
-            angle = np.arctan(np.median(radial[positive] / axial[positive]))
-            angle = float(np.clip(angle, np.deg2rad(1.0), np.deg2rad(80.0)))
+        # The sign is fixed by the median axial coordinate below. Trying both
+        # eigenvector signs therefore launches the same optimization twice.
+        axis = initial_axis
+        axial = (points - apex) @ axis
+        if np.median(axial) < 0:
+            axis = -axis
+            axial = -axial
+        radial = np.linalg.norm((points - apex) - axial[:, None] * axis, axis=1)
+        positive = axial > scale * 1e-6
+        if np.count_nonzero(positive) < 3:
+            continue
+        angle = np.arctan(np.median(radial[positive] / axial[positive]))
+        angle = float(np.clip(angle, np.deg2rad(1.0), np.deg2rad(80.0)))
 
-            def residual(parameters):
-                current_apex = parameters[:3]
-                current_axis = _normalize(parameters[3:6])
-                if current_axis is None:
-                    return np.full(len(points), 1e3)
-                vectors_to_points = points - current_apex
-                current_axial = vectors_to_points @ current_axis
-                current_radial = np.linalg.norm(
-                    vectors_to_points - current_axial[:, None] * current_axis, axis=1
-                )
-                geometric = current_radial - current_axial * np.tan(parameters[6])
-                negative_penalty = np.minimum(current_axial, 0.0)
-                return geometric + negative_penalty
-
-            initial = np.concatenate([apex, axis, [angle]])
-            lower = np.concatenate([np.full(6, -np.inf), [np.deg2rad(0.5)]])
-            upper = np.concatenate([np.full(6, np.inf), [np.deg2rad(85.0)]])
-            optimized = scipy.optimize.least_squares(
-                residual, initial, bounds=(lower, upper), max_nfev=500
+        def residual(parameters):
+            current_apex = parameters[:3]
+            current_axis = _normalize(parameters[3:6])
+            if current_axis is None:
+                return np.full(len(points), 1e3)
+            vectors_to_points = points - current_apex
+            current_axial = vectors_to_points @ current_axis
+            current_radial = np.linalg.norm(
+                vectors_to_points - current_axial[:, None] * current_axis, axis=1
             )
-            error = float(np.sqrt(np.mean(residual(optimized.x) ** 2)) / scale)
-            if best is None or error < best[0]:
-                best = (error, optimized.x)
+            geometric = current_radial - current_axial * np.tan(parameters[6])
+            negative_penalty = np.minimum(current_axial, 0.0)
+            return geometric + negative_penalty
+
+        initial = np.concatenate([apex, axis, [angle]])
+        lower = np.concatenate([np.full(6, -np.inf), [np.deg2rad(0.5)]])
+        upper = np.concatenate([np.full(6, np.inf), [np.deg2rad(85.0)]])
+        optimized = scipy.optimize.least_squares(
+            residual, initial, bounds=(lower, upper), max_nfev=500
+        )
+        error = float(np.sqrt(np.mean(residual(optimized.x) ** 2)) / scale)
+        if best is None or error < best[0]:
+            best = (error, optimized.x)
     if best is None:
         raise ValueError("cone fitting failed")
     error, parameters = best
@@ -1776,6 +1783,95 @@ def generate_curved_candidates(
     return candidates
 
 
+def generate_inner_torus_candidates(results, graph, maximum_error=0.01):
+    """Recover an inward round where a cylinder meets a planar shoulder.
+
+    The solid inside the concave toroidal surface is a short cylinder with
+    its torus tube removed. Ordinary torus candidates represent the tube
+    itself, which has the opposite surface orientation and cannot fill this
+    shoulder.
+    """
+    lookup = _result_lookup(results)
+    neighbors = _aggregated_graph(graph)
+    model_points = np.vstack(
+        [np.asarray(result["mesh"].vertices, dtype=float) for result in results]
+    )
+    model_scale = max(float(np.linalg.norm(np.ptp(model_points, axis=0))), EPSILON)
+    candidates = []
+    for patch_id, result in lookup.items():
+        if str(result.get("type", "")).upper() != "CYLINDER":
+            continue
+        if float(result.get("fit_rate", 0.0)) >= 0.55 or len(neighbors.get(patch_id, {})) < 2:
+            continue
+        if len(result["mesh"].vertices) < 32:
+            continue
+        support_ids = [
+            adjacent
+            for adjacent in neighbors[patch_id]
+            if adjacent in lookup
+            and str(lookup[adjacent].get("type", "")).upper() == "CYLINDER"
+            and _seed_fit(lookup[adjacent], "CYLINDER")[0] >= 0.8
+        ]
+        if not support_ids:
+            continue
+        points, normals = _sample_patch_points(results, [patch_id])
+        try:
+            parameters, error = fit_torus(points, normals)
+        except (ValueError, np.linalg.LinAlgError, RuntimeError):
+            continue
+        major = float(parameters["major_radius"])
+        minor = float(parameters["minor_radius"])
+        axis = _normalize(parameters["axis"])
+        if (
+            axis is None
+            or not np.isfinite(error)
+            or error > maximum_error
+            or major <= 1.1 * minor
+            or minor <= EPSILON
+            or minor > 0.1 * model_scale
+        ):
+            continue
+        matching_support = []
+        for adjacent in support_ids:
+            _, seed = _seed_fit(lookup[adjacent], "CYLINDER")
+            support_axis = _normalize(seed[3:6]) if seed.size >= 7 else None
+            if (
+                support_axis is not None
+                and abs(float(np.dot(axis, support_axis))) >= np.cos(np.deg2rad(8.0))
+                and abs(float(seed[6]) - major) <= 0.05 * major
+            ):
+                matching_support.append(adjacent)
+        if not matching_support:
+            continue
+        radial = np.linalg.norm(
+            (points - parameters["center"])
+            - ((points - parameters["center"]) @ axis)[:, None] * axis,
+            axis=1,
+        )
+        if float(np.mean(radial <= major + 0.05 * minor)) < 0.95:
+            continue
+        torus = PrimitiveCandidate("TORUS", parameters, [patch_id], error, 1.0)
+        torus_normals = _primitive_normals(torus, points)
+        orientation = float(np.mean(np.einsum("ij,ij->i", normals, torus_normals)))
+        if orientation > -0.8:
+            continue
+        axial = (points - parameters["center"]) @ axis
+        padding = max(1e-4 * model_scale, 1e-8)
+        parameters = dict(parameters)
+        parameters["extent"] = np.array([axial.min() - padding, axial.max() + padding])
+        candidates.append(
+            PrimitiveCandidate(
+                primitive_type="INNER_TORUS",
+                parameters=parameters,
+                patch_ids=[patch_id],
+                fitting_error=float(error),
+                confidence=float(np.exp(-12.0 * error)),
+                metadata={"support_patch_ids": matching_support, "inward_fillet": True},
+            )
+        )
+    return candidates
+
+
 def classify_transition_patches(results, graph):
     """Annotate patches that are likely chamfers or fillet transitions.
 
@@ -1816,7 +1912,15 @@ def classify_transition_patches(results, graph):
                 if neighbor in result_lookup
             ]
             reference_area = max(float(np.median(neighbor_areas)), EPSILON)
-            if curved_neighbors and area <= 0.35 * reference_area:
+            rounded_boundary = any(
+                neighbors[patch_id][neighbor]["dihedral_angle"]
+                < np.deg2rad(75.0)
+                for neighbor in neighbors.get(patch_id, {})
+                if neighbor in result_lookup
+                and str(result_lookup[neighbor].get("type", "")).upper()
+                in curved_neighbors
+            )
+            if curved_neighbors and rounded_boundary and area <= 0.35 * reference_area:
                 feature = "CHAMFER"
         result["feature_type"] = feature
         if feature != "SURFACE":
@@ -2637,7 +2741,10 @@ def generate_pocket_floor_cutters(results, graph, extrusion_candidates, min_plan
                 patch_ids=[patch_id],
                 fitting_error=0.0,
                 confidence=0.6,
-                metadata={"pocket_floor": True},
+                metadata={
+                    "pocket_floor": True,
+                    "connected_prisms": [list(prism.patch_ids) for prism in adjacent_prisms],
+                },
             )
         )
     return cutters
@@ -2819,6 +2926,8 @@ def generate_primitive_candidates(
             results, graph, primitive_types=tuple(curved_types), min_seed_rate=min_seed_rate
         )
     )
+    if include_torus:
+        candidates.extend(generate_inner_torus_candidates(results, graph))
     candidates.extend(generate_transition_curved_candidates(results, graph))
     candidates.extend(generate_planar_notch_cutters(results, graph, candidates))
     candidates = _drop_cube_covered_rectangles(candidates, results)
@@ -2861,15 +2970,20 @@ def primitive_bounds(candidate):
         center = np.asarray(parameters["center"])
         radius = float(parameters["radius"])
         return clipped(np.stack([center - radius, center + radius]))
-    if primitive_type in {"CYLINDER", "CONE"}:
+    if primitive_type in {"CYLINDER", "CONE", "INNER_TORUS"}:
         axis = np.asarray(parameters["axis"])
         origin = np.asarray(
-            parameters.get("axis_point", parameters.get("apex")), dtype=float
+            parameters["center"]
+            if primitive_type == "INNER_TORUS"
+            else parameters.get("axis_point", parameters.get("apex")),
+            dtype=float,
         )
         extent = np.asarray(parameters["extent"])
         endpoints = origin + extent[:, None] * axis
         if primitive_type == "CYLINDER":
             radius = float(parameters["radius"])
+        elif primitive_type == "INNER_TORUS":
+            radius = float(parameters["major_radius"])
         else:
             radius = float(max(abs(extent)) * np.tan(parameters["angle"]))
         radial_extent = radius * np.sqrt(np.maximum(0.0, 1.0 - axis**2))
@@ -2930,6 +3044,9 @@ def _primitive_normals(candidate, points, point_patch_ids=None):
         radial /= np.maximum(np.linalg.norm(radial, axis=1, keepdims=True), EPSILON)
         normals = radial - np.tan(parameters["angle"]) * axis
         return normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), EPSILON)
+    if primitive_type == "INNER_TORUS":
+        torus = PrimitiveCandidate("TORUS", parameters, [], 0.0, 0.0)
+        return -_primitive_normals(torus, points)
     if primitive_type == "TORUS":
         axis = np.asarray(parameters["axis"])
         relative = points - np.asarray(parameters["center"])
@@ -3034,6 +3151,20 @@ def primitive_contains(operation, parameters, points, tolerance=EPSILON):
         radial = np.linalg.norm(relative - axial[:, None] * axis, axis=1)
         tube = np.sqrt((radial - parameters["major_radius"]) ** 2 + axial**2)
         return clipped(tube <= parameters["minor_radius"] + tolerance)
+    if operation == "INNER_TORUS":
+        axis = np.asarray(parameters["axis"], dtype=float)
+        relative = points - np.asarray(parameters["center"], dtype=float)
+        axial = relative @ axis
+        radial = np.linalg.norm(relative - axial[:, None] * axis, axis=1)
+        extent = np.asarray(parameters["extent"], dtype=float)
+        inner_radius = parameters["major_radius"] - np.sqrt(
+            np.maximum(0.0, parameters["minor_radius"] ** 2 - axial**2)
+        )
+        return clipped(
+            (axial >= extent[0] - tolerance)
+            & (axial <= extent[1] + tolerance)
+            & (radial <= inner_radius + tolerance)
+        )
     if operation in {"EXTRUSION", "SPLINE_EXTRUSION"}:
         origin = np.asarray(parameters["axis_point"], dtype=float)
         axis = np.asarray(parameters["axis"], dtype=float)
