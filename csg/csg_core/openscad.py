@@ -89,7 +89,23 @@ def csg_to_openscad(node, indent=0):
         size = _format_vector(parameters["size"])
         base_padding = padding + "  " if parameters.get("clip_bounds") is not None else padding
         base = f"{base_padding}translate({center}) rotate({angles}) cube({size}, center=true);"
-        return _clip_shape(base, parameters.get("clip_bounds"), padding)
+        base = _clip_shape(base, parameters.get("clip_bounds"), padding)
+        clip_planes = parameters.get("clip_planes", [])
+        if not clip_planes:
+            return base
+        span = 4.0 * max(float(np.linalg.norm(parameters["size"])), 1e-6)
+        constraints = []
+        for clip in clip_planes:
+            normal = np.asarray(clip["normal"], dtype=float)
+            point = np.asarray(clip["point"], dtype=float)
+            angle, rotation_axis = _axis_rotation(normal)
+            center = point - 0.5 * span * normal
+            constraints.append(
+                f"{padding}  translate({_format_vector(center)}) "
+                f"rotate(a={angle:.9g}, v={_format_vector(rotation_axis)}) "
+                f"cube({_format_vector([2 * span, 2 * span, span])}, center=true);"
+            )
+        return f"{padding}intersection() {{\n{base}\n" + "\n".join(constraints) + f"\n{padding}}}"
     if operation == "SPHERE":
         center = _format_vector(parameters["center"])
         base_padding = padding + "  " if parameters.get("clip_bounds") is not None else padding

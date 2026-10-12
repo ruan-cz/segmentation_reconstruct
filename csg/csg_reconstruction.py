@@ -35,6 +35,7 @@ generate_planar_notch_cutters = candidates.generate_planar_notch_cutters
 generate_pocket_floor_cutters = candidates.generate_pocket_floor_cutters
 generate_cube_candidates = candidates.generate_cube_candidates
 generate_curved_candidates = candidates.generate_curved_candidates
+generate_inner_torus_candidates = candidates.generate_inner_torus_candidates
 generate_extrusion_candidates = candidates.generate_extrusion_candidates
 generate_spline_extrusion_candidates = candidates.generate_spline_extrusion_candidates
 generate_primitive_candidates = candidates.generate_primitive_candidates
@@ -73,6 +74,7 @@ __all__ = [
     "infer_intersection_groups",
     "generate_cube_candidates",
     "generate_curved_candidates",
+    "generate_inner_torus_candidates",
     "generate_primitive_candidates",
     "primitive_bounds",
     "primitive_contains",

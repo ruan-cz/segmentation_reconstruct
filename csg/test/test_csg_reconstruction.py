@@ -180,7 +180,7 @@ def test_00024448_rejects_degenerate_large_spheres():
         "example_data/final/ply/"
         "00024448_274a7c9d6def4a699961a747_trimesh_002/gt.ply"
     )
-    _, _, results, graph = _prepare_example_graph(ply_path)
+    mesh, _, results, graph = _prepare_example_graph(ply_path)
     candidates = generate_primitive_candidates(results, graph)
 
     assert not [
@@ -193,6 +193,21 @@ def test_00024448_rejects_degenerate_large_spheres():
     csg_ir, selected, _ = reconstruct_csg_tree(candidates, results)
     assert csg_ir["op"] == "UNION"
     assert all(candidate.primitive_type == "CUBE" for candidate in selected)
+    clipped = [candidate for candidate in selected if candidate.parameters.get("clip_planes")]
+    assert len(clipped) == 4
+    assert {clip["patch_id"] for candidate in clipped for clip in candidate.parameters["clip_planes"]} == {
+        2, 3, 12, 14, 16, 18, 21, 22
+    }
+    for patch_id in (2, 3, 12, 14, 16, 18, 21, 22):
+        patch = results[patch_id]["mesh"]
+        points = patch.triangles_center
+        normals = patch.face_normals
+        assert np.mean(csg_contains(csg_ir, points - 0.001 * normals)) > 0.99
+        assert np.mean(~csg_contains(csg_ir, points + 0.001 * normals)) > 0.99
+    report = validate_csg(csg_ir, selected, results, target_mesh=mesh)
+    assert report["surface_coverage"] == 1.0
+    assert report["voxel_iou"] > 0.99
+    assert csg_to_openscad(csg_ir).count("intersection()") >= 4
 
 
 def test_00025710_keeps_both_subtractive_cylinders():
@@ -396,7 +411,7 @@ def test_00023582_selects_polygonal_extrusion_candidate():
     csg_ir, selected, _ = reconstruct_csg_tree(candidates, results)
     assert any(
         candidate.primitive_type == "EXTRUSION"
-        and candidate.patch_ids == extrusion.patch_ids
+        and set(candidate.patch_ids).issuperset(extrusion.patch_ids)
         for candidate in selected
     )
     assert "linear_extrude" in csg_to_openscad(csg_ir)
@@ -488,6 +503,190 @@ def test_00023582_recovers_inward_round_without_false_chamfer():
     assert report["surface_coverage"] > 0.99
     assert report["voxel_iou"] > 0.99
     assert "rotate_extrude" in csg_to_openscad(csg_ir)
+
+
+def test_00140710_fits_shoulder_round_as_inward_torus():
+    ply_path = Path(
+        "example_data/final/ply/"
+        "00140710_33073a6cb55fadd20ec0e3fb_trimesh_001/gt.ply"
+    )
+    mesh, _, results, graph = _prepare_example_graph(ply_path)
+    candidates = generate_primitive_candidates(results, graph)
+    rounded = next(
+        candidate
+        for candidate in candidates
+        if candidate.primitive_type == "INNER_TORUS" and candidate.patch_ids == [2]
+    )
+    cone = next(
+        candidate
+        for candidate in candidates
+        if candidate.primitive_type == "CONE" and candidate.patch_ids == [2]
+    )
+    assert rounded.fitting_error < 0.2 * cone.fitting_error
+    assert 6 in rounded.metadata["support_patch_ids"]
+    classify_boolean_operations(candidates, results)
+    csg_ir, selected, _ = reconstruct_csg_tree(candidates, results)
+    assert any(
+        candidate.primitive_type == "INNER_TORUS" and candidate.patch_ids == [2]
+        for candidate in selected
+    )
+    assert all(
+        candidate.primitive_type != "CONE" or candidate.patch_ids != [2]
+        for candidate in selected
+    )
+    assert {(candidate.primitive_type, tuple(candidate.patch_ids)) for candidate in selected}.issuperset(
+        {("CYLINDER", (0, 3)), ("CYLINDER", (5, 6))}
+    )
+    patch = results[2]["mesh"]
+    points = patch.triangles_center
+    normals = patch.face_normals
+    assert np.mean(csg_contains(csg_ir, points - 0.005 * normals)) > 0.99
+    assert np.mean(~csg_contains(csg_ir, points + 0.005 * normals)) > 0.99
+    assert validate_csg(csg_ir, selected, results, target_mesh=mesh, voxel_resolution=96)[
+        "voxel_iou"
+    ] > 0.999
+
+
+def test_00025063_both_end_rounds_trim_the_hexagonal_nut():
+    ply_path = Path(
+        "example_data/final/ply/"
+        "00025063_9347be1a9dad4e70852dcce2_trimesh_000/gt.ply"
+    )
+    mesh, _, results, graph = _prepare_example_graph(ply_path)
+    candidates = generate_primitive_candidates(results, graph)
+    classify_boolean_operations(candidates, results)
+    csg_ir, selected, _ = reconstruct_csg_tree(candidates, results)
+
+    # Each end round is one observed surface and one conical constraint on
+    # the hexagonal body. Unioning the cones would leave the flat prism's
+    # corner material in place even though all candidate patches are covered.
+    base = csg_ir["children"][0]
+    assert base["op"] == "INTERSECTION"
+    assert {node["op"] for node in base["children"]} == {"EXTRUSION", "CONE"}
+    assert {tuple(node["patch_ids"]) for node in base["children"] if node["op"] == "CONE"} == {
+        (1, 4), (2, 10)
+    }
+    probes = np.array(
+        [[0.35, 0.12, 0], [0.30, 0.13, 0], [0.35, -0.12, 0], [0.30, -0.13, 0]]
+    )
+    assert list(csg_contains(csg_ir, probes)) == [False, True, False, True]
+    # The body was extended to both observed end faces. The central cutter
+    # must pass those faces too, or sub-voxel solid caps close the bore.
+    hole_axis = np.column_stack(
+        [np.zeros(11), np.linspace(-0.13374, 0.13374, 11), np.zeros(11)]
+    )
+    assert not np.any(csg_contains(csg_ir, hole_axis))
+    end_rings = np.array([[0.25, -0.13374, 0], [0.25, 0.13374, 0]])
+    assert np.all(csg_contains(csg_ir, end_rings))
+    for patch_id in (1, 10):
+        patch = results[patch_id]["mesh"]
+        points = patch.triangles_center
+        normals = patch.face_normals
+        assert np.mean(csg_contains(csg_ir, points - 0.001 * normals)) > 0.99
+        assert np.mean(~csg_contains(csg_ir, points + 0.001 * normals)) > 0.99
+    report = validate_csg(csg_ir, selected, results, target_mesh=mesh, voxel_resolution=96)
+    assert report["surface_coverage"] > 0.99
+    assert report["voxel_iou"] > 0.999
+
+
+def test_00141097_stepped_hole_cutters_overlap_at_seam():
+    ply_path = Path(
+        "example_data/final/ply/"
+        "00141097_57222034e4b08229a097b208_trimesh_010/gt.ply"
+    )
+    mesh, _, results, graph = _prepare_example_graph(ply_path)
+    candidates = generate_primitive_candidates(results, graph)
+    classify_boolean_operations(candidates, results)
+    csg_ir, selected, _ = reconstruct_csg_tree(candidates, results)
+
+    additive = csg_ir["children"][0]["children"]
+    cone_joins = [
+        node for node in additive
+        if node["op"] == "INTERSECTION"
+        and {child["op"] for child in node["children"]} == {"CONE", "CYLINDER"}
+    ]
+    assert len(cone_joins) == 3
+    for joint in cone_joins:
+        cone = next(child for child in joint["children"] if child["op"] == "CONE")
+        original = next(candidate for candidate in selected if candidate.patch_ids == cone["patch_ids"])
+        assert np.ptp(cone["parameters"]["extent"]) > np.ptp(original.parameters["extent"]) + 1e-4
+    fillets = [node for node in additive if node["op"] == "INNER_TORUS"]
+    assert len(fillets) == 2
+    assert all(min(abs(value) for value in node["parameters"]["extent"]) == 0.0 for node in fillets)
+    assert not np.any(csg_contains(csg_ir, np.array([[29.392, 7.93752, 0], [43.632, 7.93752, 0]])))
+
+    cutters = csg_ir["children"][1]["children"]
+    for shallow_ids, deep_ids in (([9], [7, 11]), ([17], [14, 20]), ([8], [0, 3])):
+        shallow = next(node for node in cutters if node["patch_ids"] == shallow_ids)
+        deep = next(node for node in cutters if node["patch_ids"] == deep_ids)
+        shallow_end = (
+            np.asarray(shallow["parameters"]["axis_point"])[0]
+            + np.asarray(shallow["parameters"]["extent"])[1]
+        )
+        deep_start = (
+            np.asarray(deep["parameters"]["axis_point"])[0]
+            + np.asarray(deep["parameters"]["extent"])[0]
+        )
+        assert shallow_end - deep_start > 1e-4
+    # These openings are on local flange faces, well inside the model's
+    # global X bounds.  The cutter must cross each face to avoid thin caps.
+    for node in cutters:
+        axis = np.asarray(node["parameters"]["axis"], dtype=float)
+        origin = np.asarray(node["parameters"]["axis_point"], dtype=float)
+        stations = origin[0] + np.asarray(node["parameters"]["extent"]) * axis[0]
+        if node["patch_ids"] in ([9], [17], [8]):
+            assert min(stations) < 30.1625 - 0.01
+        if node["patch_ids"] in ([0, 3], [7, 11], [14, 20]):
+            assert max(stations) > 42.8625 + 0.01
+    for shallow_node in (node for node in cutters if node["patch_ids"] in ([9], [17], [8])):
+        center = np.asarray(shallow_node["parameters"]["axis_point"], dtype=float)
+        centerline = np.column_stack(
+            [np.linspace(30.17, 42.85, 1001),
+             np.full(1001, center[1]), np.full(1001, center[2])]
+        )
+        assert not np.any(csg_contains(csg_ir, centerline))
+    assert validate_csg(csg_ir, selected, results, target_mesh=mesh)["voxel_iou"] > 0.99
+
+
+def test_00140982_rejects_cross_pocket_extrusions():
+    ply_path = Path(
+        "example_data/final/ply/"
+        "00140982_f2e481e34cff3a450799acac_trimesh_000/gt.ply"
+    )
+    mesh, _, results, graph = _prepare_example_graph(ply_path)
+    candidates = generate_primitive_candidates(results, graph)
+    assert not any(
+        candidate.primitive_type == "EXTRUSION"
+        and set(candidate.patch_ids) in ({0, 1, 5, 19, 21}, {5, 12, 13, 19, 21})
+        for candidate in candidates
+    )
+    classify_boolean_operations(candidates, results)
+    csg_ir, selected, _ = reconstruct_csg_tree(candidates, results)
+    assert any(candidate.primitive_type == "CYLINDER" and candidate.patch_ids == [7]
+               and candidate.operation == "SUBTRACT" for candidate in selected)
+    assert sum(candidate.primitive_type == "EXTRUSION" and candidate.operation == "SUBTRACT"
+               for candidate in selected) == 2
+    assert any(candidate.primitive_type == "CUBE" and candidate.operation == "ADD"
+               and abs(candidate.parameters["center"][2] - 3.0) < 1e-3
+               for candidate in selected)
+    supports = csg_ir["children"][0]["children"][-1:]
+    assert len(supports) == 1
+    assert supports[0].get("feature") == "concave_cylinder_fillet_support"
+    assert supports[0]["source_patch_ids"] == [7]
+    assert "rotate(" in csg_to_openscad(supports[0])
+    patch = results[7]["mesh"]
+    epsilon = 0.001 * np.linalg.norm(mesh.extents)
+    inside = csg_contains(csg_ir, patch.triangles_center - epsilon * patch.face_normals)
+    outside = csg_contains(csg_ir, patch.triangles_center + epsilon * patch.face_normals)
+    assert np.mean(inside & ~outside) > 0.98
+    report = validate_csg(csg_ir, selected, results, target_mesh=mesh)
+    assert report["surface_coverage"] > 0.9
+    assert report["voxel_iou"] > 0.995
+    fine_report = validate_csg(
+        csg_ir, selected, results, target_mesh=mesh,
+        voxel_resolution=96, maximum_voxels=1000000,
+    )
+    assert fine_report["voxel_iou"] > 0.997
 
 
 def test_00140553_recovers_beam_between_rotated_arms():

@@ -167,6 +167,26 @@ def _can_append_candidate(selected, candidate, results=None):
             )
         if len(points) and np.mean(covered) >= 0.9:
             return True
+        # A concave transition can lie mostly outside each mother solid's
+        # fitted extent.  Its observed wall still borders those ADD patches,
+        # and the cutter intersects enough of them to shape the union.
+        if (
+            candidate.primitive_type == "CYLINDER"
+            and candidate.metadata.get("orientation_score", 0.0) < -0.8
+            and len(points)
+            and np.mean(covered) >= 0.3
+        ):
+            lookup = candidate_module._result_lookup(results)
+            neighbors = set()
+            for patch_id in candidate.patch_ids:
+                neighbors.update(lookup[patch_id].get("neighboring_patches", []))
+            adjacent_additive = {
+                patch_id
+                for item in selected if item.operation == "ADD"
+                for patch_id in item.patch_ids
+            }
+            if neighbors & adjacent_additive:
+                return True
     for item in selected:
         if item.operation != "ADD":
             continue
@@ -635,6 +655,479 @@ def _overlap_coaxial_cutters(candidates, nodes, model_scale):
             second_parameters["extent"] = second_extent.tolist()
 
 
+def _extend_through_hole_cutters(candidates, nodes, results, model_points, model_scale):
+    """Carry observed through holes beyond both exterior end faces.
+
+    Boolean tolerances or an extended additive body can otherwise leave a
+    very thin cap over a hole even when the fitted hole wall spans the model.
+    Only cylinders whose observed wall reaches both model extrema along the
+    cylinder axis qualify; blind holes keep their fitted depth.
+    """
+    lookup = candidate_module._result_lookup(results)
+    seam_tolerance = max(1e-4 * model_scale, 1e-7)
+    overlap = max(5e-4 * model_scale, 1e-7)
+    for candidate, node in zip(candidates, nodes):
+        if candidate.primitive_type != "CYLINDER":
+            continue
+        axis = candidate_module._normalize(node["parameters"]["axis"])
+        if axis is None:
+            continue
+        wall_patch_ids = set(candidate.patch_ids) - set(
+            candidate.metadata.get("cap_patch_ids", [])
+        )
+        if not wall_patch_ids:
+            continue
+        wall_points = np.vstack(
+            [np.asarray(lookup[patch_id]["mesh"].vertices, dtype=float) for patch_id in wall_patch_ids]
+        )
+        model_stations = model_points @ axis
+        wall_stations = wall_points @ axis
+        if (
+            abs(float(wall_stations.min() - model_stations.min())) > seam_tolerance
+            or abs(float(wall_stations.max() - model_stations.max())) > seam_tolerance
+        ):
+            continue
+        origin = np.asarray(node["parameters"]["axis_point"], dtype=float)
+        current = np.asarray(node["parameters"]["extent"], dtype=float)
+        offset = float(origin @ axis)
+        node["parameters"]["extent"] = [
+            float(min(current.min(), model_stations.min() - offset - overlap)),
+            float(max(current.max(), model_stations.max() - offset + overlap)),
+        ]
+
+
+def _extend_cutters_at_additive_mouths(
+    candidates, nodes, additive_candidates, results, model_scale
+):
+    """Pass a local exterior face when a cutter wall ends at its opening.
+
+    A stepped hole can open on a flange face well inside the model's global
+    bounds.  The wall/face graph identifies that opening without extending a
+    blind hole through its (subtractive) floor.
+    """
+    lookup = candidate_module._result_lookup(results)
+    additive_patches = {
+        patch_id for candidate in additive_candidates for patch_id in candidate.patch_ids
+    }
+    seam_tolerance = max(1e-4 * model_scale, 1e-7)
+    overlap = max(5e-4 * model_scale, 1e-7)
+    for candidate, node in zip(candidates, nodes):
+        if candidate.primitive_type != "CYLINDER":
+            continue
+        axis = candidate_module._normalize(node["parameters"]["axis"])
+        if axis is None:
+            continue
+        wall_ids = set(candidate.patch_ids) - set(
+            candidate.metadata.get("cap_patch_ids", [])
+        )
+        neighboring = set()
+        for patch_id in wall_ids:
+            neighboring.update(lookup[patch_id].get("neighboring_patches", []))
+        opening_ids = (neighboring & additive_patches) - set(candidate.patch_ids)
+        if not opening_ids:
+            continue
+        parameters = node["parameters"]
+        extent = np.asarray(parameters["extent"], dtype=float)
+        offset = float(np.asarray(parameters["axis_point"], dtype=float) @ axis)
+        stations = offset + extent
+        for patch_id in opening_ids:
+            face = lookup[patch_id]
+            fit_rate, _ = candidate_module._seed_fit(face, "PLANE")
+            if fit_rate < 0.8:
+                continue
+            mesh = face["mesh"]
+            normal = candidate_module._normalize(
+                np.average(mesh.face_normals, axis=0, weights=mesh.area_faces)
+            )
+            if normal is None:
+                continue
+            face_stations = np.asarray(mesh.vertices, dtype=float) @ axis
+            if np.ptp(face_stations) > seam_tolerance:
+                continue
+            face_station = float(np.mean(face_stations))
+            for end, direction in ((int(np.argmin(stations)), -1), (int(np.argmax(stations)), 1)):
+                if (
+                    np.dot(normal, axis) * direction > 0.95
+                    and abs(face_station - stations[end]) <= seam_tolerance
+                ):
+                    extent[end] = face_station - offset + direction * overlap
+        parameters["extent"] = extent.tolist()
+
+
+def _apply_conical_end_constraints(additive, results, model_scale):
+    """Trim a polygonal body with its fitted conical end surfaces.
+
+    Adding a cone to a full prism cannot form an end chamfer: the prism fills
+    the volume that the cone should remove. Extend the prism to the observed
+    end faces, extend each cone inward until it contains the whole opposite
+    end of the prism, then intersect these solids.
+    """
+    tolerance = max(1e-4 * model_scale, 1e-7)
+    lookup = candidate_module._result_lookup(results)
+    extrusions = [
+        (index, item[0])
+        for index, item in enumerate(additive)
+        if item[0].primitive_type == "EXTRUSION"
+    ]
+    matches = {}
+    for cone_index, (cone, _) in enumerate(additive):
+        if cone.primitive_type != "CONE":
+            continue
+        cone_axis = candidate_module._normalize(cone.parameters["axis"])
+        cone_apex = np.asarray(cone.parameters["apex"], dtype=float)
+        points = np.vstack(
+            [np.asarray(lookup[patch_id]["mesh"].vertices, dtype=float) for patch_id in cone.patch_ids]
+        )
+        for extrusion_index, extrusion in extrusions:
+            axis = candidate_module._normalize(extrusion.parameters["axis"])
+            if (
+                axis is None
+                or cone_axis is None
+                or abs(float(np.dot(axis, cone_axis))) < np.cos(np.deg2rad(3.0))
+            ):
+                continue
+            if not any(
+                set(lookup[patch_id].get("neighboring_patches", []))
+                .intersection(extrusion.patch_ids)
+                for patch_id in cone.patch_ids
+            ):
+                continue
+            origin = np.asarray(extrusion.parameters["axis_point"], dtype=float)
+            if np.linalg.norm(np.cross(cone_apex - origin, axis)) > 0.02 * model_scale:
+                continue
+            basis = np.asarray(extrusion.parameters["basis"], dtype=float)
+            polygon = np.asarray(extrusion.parameters["polygon"], dtype=float)
+            local = (points - origin) @ basis
+            inside = candidate_module._point_in_polygon(local, polygon)
+            if np.any(~inside) and np.max(
+                candidate_module._polygon_boundary_distance(local[~inside], polygon)
+            ) > tolerance:
+                continue
+            matches.setdefault(extrusion_index, []).append((cone_index, points))
+            break
+
+    replacements = {}
+    consumed = set()
+    for extrusion_index, linked_cones in matches.items():
+        extrusion, body = additive[extrusion_index]
+        parameters = extrusion.parameters
+        origin = np.asarray(parameters["axis_point"], dtype=float)
+        axis = candidate_module._normalize(parameters["axis"])
+        basis = np.asarray(parameters["basis"], dtype=float)
+        polygon = np.asarray(parameters["polygon"], dtype=float)
+        original_extent = np.asarray(body["parameters"]["extent"], dtype=float)
+        accepted = []
+        for cone_index, points in linked_cones:
+            cone, _ = additive[cone_index]
+            cone_axis = candidate_module._normalize(cone.parameters["axis"])
+            apex = np.asarray(cone.parameters["apex"], dtype=float)
+            trial_extent = original_extent.copy()
+            station = (points - origin) @ axis
+            trial_extent[0] = min(trial_extent[0], float(station.min()) - tolerance)
+            trial_extent[1] = max(trial_extent[1], float(station.max()) + tolerance)
+            body_ends = origin + trial_extent[:, None] * axis
+            cone_stations = (body_ends - apex) @ cone_axis
+            far_end = body_ends[int(np.argmax(cone_stations))]
+            far_polygon = far_end + polygon @ basis.T
+            radial = np.linalg.norm(np.cross(far_polygon - apex, cone_axis), axis=1)
+            far_radius = float(cone_stations.max() * np.tan(cone.parameters["angle"]))
+            if far_radius < float(radial.max()) - tolerance:
+                continue
+            accepted.append((cone_index, points))
+        if not accepted:
+            continue
+        extent = original_extent.copy()
+        for _, points in accepted:
+            station = (points - origin) @ axis
+            extent[0] = min(extent[0], float(station.min()) - tolerance)
+            extent[1] = max(extent[1], float(station.max()) + tolerance)
+        constraints = []
+        for cone_index, _ in accepted:
+            cone, cone_node = additive[cone_index]
+            cone_axis = candidate_module._normalize(cone.parameters["axis"])
+            apex = np.asarray(cone.parameters["apex"], dtype=float)
+            cone_stations = (origin + extent[:, None] * axis - apex) @ cone_axis
+            cone_extent = np.asarray(cone_node["parameters"]["extent"], dtype=float)
+            cone_node["parameters"]["extent"] = [
+                float(min(cone_extent.min(), cone_stations.min()) - tolerance),
+                float(max(cone_extent.max(), cone_stations.max()) + tolerance),
+            ]
+            constraints.append(cone_node)
+            consumed.add(cone_index)
+        body["parameters"]["extent"] = extent.tolist()
+        replacements[extrusion_index] = (
+            extrusion,
+            {"op": "INTERSECTION", "children": [body, *constraints]},
+        )
+    additive[:] = [
+        replacements.get(index, item)
+        for index, item in enumerate(additive)
+        if index not in consumed
+    ]
+
+
+def _join_inward_torus_supports(additive, model_scale):
+    """Move a tangent fillet's padding inside its supporting cylinder."""
+    overlap = max(1e-4 * model_scale, 1e-8)
+    cylinders = [item for item in additive if item[0].primitive_type == "CYLINDER"]
+    for fillet, fillet_node in additive:
+        if fillet.primitive_type != "INNER_TORUS":
+            continue
+        parameters = fillet_node["parameters"]
+        center = np.asarray(parameters["center"], dtype=float)
+        axis = candidate_module._normalize(parameters["axis"])
+        extent = np.asarray(parameters["extent"], dtype=float)
+        near = int(np.argmin(np.abs(extent)))
+        far = 1 - near
+        if abs(extent[near]) > 1.1 * overlap or abs(extent[far]) < 5.0 * overlap:
+            continue
+        inner_radius = float(parameters["major_radius"] - parameters["minor_radius"])
+        for support, support_node in cylinders:
+            support_parameters = support_node["parameters"]
+            support_axis = candidate_module._normalize(support_parameters["axis"])
+            support_origin = np.asarray(support_parameters["axis_point"], dtype=float)
+            if (
+                support_axis is None
+                or abs(float(np.dot(axis, support_axis))) < np.cos(np.deg2rad(1.0))
+                or abs(float(support_parameters["radius"]) - inner_radius) > overlap
+                or np.linalg.norm(np.cross(center - support_origin, support_axis)) > overlap
+            ):
+                continue
+            support_extent = np.asarray(support_parameters["extent"], dtype=float)
+            support_ends = support_origin + support_extent[:, None] * support_axis
+            touching = int(np.argmin(np.linalg.norm(support_ends - center, axis=1)))
+            if np.linalg.norm(support_ends[touching] - center) > overlap:
+                continue
+            to_fillet = (center + extent[far] * axis) - support_ends[touching]
+            to_support = support_ends[1 - touching] - support_ends[touching]
+            if float(np.dot(to_fillet, to_support)) >= 0.0:
+                continue
+            direction = np.sign(float(np.dot(to_fillet, support_axis)))
+            extent[near] = 0.0
+            support_extent[touching] += direction * overlap
+            parameters["extent"] = extent.tolist()
+            support_parameters["extent"] = support_extent.tolist()
+            break
+
+
+def _bridge_additive_cone_seams(additive, model_scale):
+    """Overlap tangent cone/cylinder solids without adding an outer lip."""
+    overlap = max(1e-5 * model_scale, 1e-8)
+    seam_tolerance = max(1e-4 * model_scale, 1e-7)
+    cylinders = [item for item in additive if item[0].primitive_type == "CYLINDER"]
+    for index, (cone, cone_node) in enumerate(additive):
+        if cone.primitive_type != "CONE" or cone_node["op"] != "CONE":
+            continue
+        parameters = cone_node["parameters"]
+        cone_axis = candidate_module._normalize(parameters["axis"])
+        apex = np.asarray(parameters["apex"], dtype=float)
+        extent = np.asarray(parameters["extent"], dtype=float)
+        cone_ends = apex + extent[:, None] * cone_axis
+        radii = np.maximum(0.0, extent) * np.tan(parameters["angle"])
+        for support, support_node in cylinders:
+            support_parameters = support_node["parameters"]
+            support_axis = candidate_module._normalize(support_parameters["axis"])
+            support_origin = np.asarray(support_parameters["axis_point"], dtype=float)
+            if (
+                support_axis is None
+                or abs(float(np.dot(cone_axis, support_axis))) < np.cos(np.deg2rad(1.0))
+                or np.linalg.norm(np.cross(apex - support_origin, support_axis))
+                > seam_tolerance
+            ):
+                continue
+            support_radius = float(support_parameters["radius"])
+            support_extent = np.asarray(support_parameters["extent"], dtype=float)
+            support_ends = support_origin + support_extent[:, None] * support_axis
+            distances = np.linalg.norm(cone_ends[:, None] - support_ends[None, :], axis=2)
+            cone_end, support_end = np.unravel_index(np.argmin(distances), distances.shape)
+            if (
+                distances[cone_end, support_end] > seam_tolerance
+                or abs(float(radii[cone_end]) - support_radius) > seam_tolerance
+                or radii[1 - cone_end] > support_radius + seam_tolerance
+            ):
+                continue
+            to_support = support_ends[1 - support_end] - cone_ends[cone_end]
+            to_cone = cone_ends[1 - cone_end] - cone_ends[cone_end]
+            if float(np.dot(to_support, to_cone)) >= 0.0:
+                continue
+            direction = np.sign(float(np.dot(to_support, cone_axis)))
+            extended = extent.copy()
+            extended[cone_end] += direction * overlap
+            parameters["extent"] = extended.tolist()
+            radial_clip = {
+                "op": "CYLINDER",
+                "parameters": {
+                    "axis_point": apex.tolist(),
+                    "axis": cone_axis.tolist(),
+                    "extent": extended.tolist(),
+                    "radius": support_radius,
+                },
+            }
+            additive[index] = (
+                cone,
+                {"op": "INTERSECTION", "children": [cone_node, radial_clip]},
+            )
+            break
+
+
+def _concave_cylinder_fillet_supports(additive, cutters, results, model_scale):
+    """Fill the tangent wedge between a round boss and a planar body.
+
+    The selected inward cylinder remains the cutter.  This adds only the
+    missing local mother volume below its observed arc; patch growing and
+    candidate selection are unchanged.
+    """
+    lookup = candidate_module._result_lookup(results)
+    tolerance = max(5e-4 * model_scale, 1e-7)
+    join_overlap = max(1e-4 * model_scale, 1e-8)
+    supports = []
+    convex_cylinders = [
+        candidate for candidate, _ in additive if candidate.primitive_type == "CYLINDER"
+    ]
+    planar_bodies = [
+        candidate for candidate, _ in additive if candidate.primitive_type == "CUBE"
+    ]
+    for cutter in cutters:
+        if (
+            cutter.primitive_type != "CYLINDER"
+            or cutter.metadata.get("orientation_score", 0) >= -0.8
+        ):
+            continue
+        wall_ids = set(cutter.patch_ids) - set(cutter.metadata.get("cap_patch_ids", []))
+        neighbors = set()
+        for patch_id in wall_ids:
+            neighbors.update(lookup[patch_id].get("neighboring_patches", []))
+        if not neighbors:
+            continue
+        inward_axis = candidate_module._normalize(cutter.parameters["axis"])
+        inward_origin = np.asarray(cutter.parameters["axis_point"], dtype=float)
+        inward_radius = float(cutter.parameters["radius"])
+        if inward_axis is None or inward_radius <= tolerance:
+            continue
+        wall_points, _ = candidate_module._sample_patch_points(
+            results, list(wall_ids), 1000
+        )
+        matches = []
+        for convex in convex_cylinders:
+            if not neighbors.intersection(convex.patch_ids):
+                continue
+            convex_axis = candidate_module._normalize(convex.parameters["axis"])
+            if (
+                convex_axis is None
+                or abs(float(np.dot(convex_axis, inward_axis)))
+                < np.cos(np.deg2rad(1.0))
+            ):
+                continue
+            convex_origin = np.asarray(convex.parameters["axis_point"], dtype=float)
+            convex_radius = float(convex.parameters["radius"])
+            center_delta = inward_origin - convex_origin
+            center_delta -= float(center_delta @ convex_axis) * convex_axis
+            center_distance = float(np.linalg.norm(center_delta))
+            tangent_error = abs(center_distance - convex_radius - inward_radius)
+            if tangent_error > tolerance:
+                continue
+            for body in planar_bodies:
+                for patch_id in neighbors.intersection(body.patch_ids):
+                    face = lookup[patch_id]
+                    fit_rate, _ = candidate_module._seed_fit(face, "PLANE")
+                    if fit_rate < 0.8:
+                        continue
+                    mesh = face["mesh"]
+                    normal = candidate_module._normalize(
+                        np.average(mesh.face_normals, axis=0, weights=mesh.area_faces)
+                    )
+                    if normal is None or abs(float(normal @ convex_axis)) > 0.02:
+                        continue
+                    face_center = np.mean(np.asarray(mesh.vertices, dtype=float), axis=0)
+                    plane_from_convex = float((face_center - convex_origin) @ normal)
+                    cutter_height = float(center_delta @ normal)
+                    if (
+                        abs(plane_from_convex) > tolerance
+                        or abs(cutter_height - inward_radius) > tolerance
+                    ):
+                        continue
+                    axis = convex_axis.copy()
+                    normal = candidate_module._normalize(
+                        normal - float(normal @ axis) * axis
+                    )
+                    radial = np.cross(normal, axis)
+                    if float(center_delta @ radial) < 0:
+                        axis = -axis
+                        radial = -radial
+                    tangent = center_delta * (
+                        convex_radius / (convex_radius + inward_radius)
+                    )
+                    radial_low = float(tangent @ radial) - join_overlap
+                    radial_high = float(center_delta @ radial)
+                    normal_low = plane_from_convex - join_overlap
+                    normal_high = cutter_height
+                    if (
+                        radial_high - radial_low <= tolerance
+                        or normal_high - normal_low <= tolerance
+                    ):
+                        continue
+                    convex_ends = (
+                        convex_origin
+                        + np.asarray(convex.parameters["extent"])[:, None] * convex_axis
+                    )
+                    inward_ends = (
+                        inward_origin
+                        + np.asarray(cutter.parameters["extent"])[:, None] * inward_axis
+                    )
+                    face_stations = np.asarray(mesh.vertices, dtype=float) @ axis
+                    axial_low = max(
+                        float((convex_ends @ axis).min()),
+                        float((inward_ends @ axis).min()),
+                        float(face_stations.min()),
+                    )
+                    axial_high = min(
+                        float((convex_ends @ axis).max()),
+                        float((inward_ends @ axis).max()),
+                        float(face_stations.max()),
+                    )
+                    if axial_high - axial_low <= 2 * tolerance:
+                        continue
+                    center = (
+                        convex_origin
+                        + ((axial_low + axial_high) / 2 - float(convex_origin @ axis)) * axis
+                        + (radial_low + radial_high) / 2 * radial
+                        + (normal_low + normal_high) / 2 * normal
+                    )
+                    rotation = np.column_stack((axis, radial, normal))
+                    support = {
+                        "op": "CUBE",
+                        "parameters": {
+                            "center": center.tolist(),
+                            "size": [
+                                axial_high - axial_low,
+                                radial_high - radial_low,
+                                normal_high - normal_low,
+                            ],
+                            "rotation": rotation.tolist(),
+                            "euler_xyz_degrees": candidate_module._matrix_to_euler_xyz(
+                                rotation
+                            ).tolist(),
+                        },
+                        "patch_ids": [],
+                        "feature": "concave_cylinder_fillet_support",
+                        "source_patch_ids": list(cutter.patch_ids),
+                    }
+                    contained = candidate_module.primitive_contains(
+                        "CUBE", support["parameters"], wall_points,
+                        tolerance=tolerance,
+                    )
+                    if float(np.mean(contained)) < 0.9:
+                        continue
+                    score = (
+                        tangent_error + abs(plane_from_convex)
+                        + abs(cutter_height - inward_radius)
+                    )
+                    matches.append((score, support))
+        if matches:
+            supports.append(min(matches, key=lambda item: item[0])[1])
+    return supports
+
+
 def build_csg_ir(
     selected_candidates,
     results=None,
@@ -739,11 +1232,23 @@ def build_csg_ir(
 
     if not additive:
         return {"op": "EMPTY", "children": []}
+    if results is not None:
+        points = np.vstack([np.asarray(result["mesh"].vertices, dtype=float) for result in results])
+        model_scale = max(float(np.linalg.norm(np.ptp(points, axis=0))), candidate_module.EPSILON)
+        _apply_conical_end_constraints(additive, results, model_scale)
+        _join_inward_torus_supports(additive, model_scale)
+        _bridge_additive_cone_seams(additive, model_scale)
     base = _build_additive_ir(
         additive,
         results,
         coverage_threshold=intersection_coverage_threshold,
     )
+    if results is not None and subtractive:
+        supports = _concave_cylinder_fillet_supports(
+            additive, subtractive_candidates, results, model_scale
+        )
+        if supports:
+            base = {"op": "UNION", "children": [base, *supports]}
     if not subtractive:
         return (
             base
@@ -751,10 +1256,14 @@ def build_csg_ir(
             else {"op": "UNION", "children": [base, *restorative]}
         )
     if results is not None:
-        points = np.vstack([np.asarray(result["mesh"].vertices, dtype=float) for result in results])
-        model_scale = max(float(np.linalg.norm(np.ptp(points, axis=0))), candidate_module.EPSILON)
         _stitch_pocket_cutters(subtractive_candidates, subtractive, model_scale)
         _overlap_coaxial_cutters(subtractive_candidates, subtractive, model_scale)
+        _extend_through_hole_cutters(
+            subtractive_candidates, subtractive, results, points, model_scale
+        )
+        _extend_cutters_at_additive_mouths(
+            subtractive_candidates, subtractive, additive_candidates, results, model_scale
+        )
     subtraction = (
         subtractive[0]
         if len(subtractive) == 1

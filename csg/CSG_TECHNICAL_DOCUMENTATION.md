@@ -31,7 +31,7 @@ segmented PLY（面片带 RGB segment 颜色）
   └─ [Step 9] OpenSCAD 代码生成                      csg_core/openscad.py
 ```
 
-支持的 primitive 类型：`CUBE`（含旋转 cube）、`CYLINDER`、`CONE`、`SPHERE`、`TORUS`、`EXTRUSION`（多边形线性拉伸）、`SPLINE_EXTRUSION`（B 样条轮廓拉伸）。
+支持的 primitive 类型：`CUBE`（含旋转 cube）、`CYLINDER`、`CONE`、`SPHERE`、`TORUS`、`INNER_TORUS`（向内圆角的实体）、`EXTRUSION`（多边形线性拉伸）、`SPLINE_EXTRUSION`（B 样条轮廓拉伸）。
 支持的 Boolean 节点：`UNION`、`DIFFERENCE`、`INTERSECTION`、`EMPTY`。
 
 整个流程不依赖神经网络，全部基于解析几何与图算法：最小二乘拟合、协方差特征分解、图分割/区域生长、包含性查询、beam search、体素近似验证。
@@ -128,9 +128,11 @@ classify_transition_patches          # 标记圆角/倒角 patch
 → generate_extrusion_candidates
 → generate_spline_extrusion_candidates
 → generate_curved_candidates         # CYLINDER / CONE / SPHERE [/ TORUS]
+→ generate_inner_torus_candidates    # 低柱面拟合率的向内圆角
 → generate_transition_curved_candidates
 → generate_planar_notch_cutters      # 圆柱弦切面盒形刀具
 → generate_pocket_floor_cutters      # 凹槽围出的中心柱刀具
+→ _filter_mixed_orientation_extrusions # 剔除同时解释内外朝向面片的伪拉伸体
 → 按 (primitive_type, patch_ids, transition) 去重
 → 按 confidence 降序、fitting error 升序排序
 ```
@@ -142,7 +144,7 @@ classify_transition_patches          # 标记圆角/倒角 patch
 `classify_transition_patches()` 在生成主 candidate 前先标记过渡面：
 
 - `FILLET_OR_CHAMFER`：低质量 sphere patch（径向方向协方差最小/最大特征值之比 < 0.03，即 surface quality 不足的条带）；
-- `CHAMFER`：小 plane patch（面积 ≤ 0.35 × 邻居面积中位数，且有曲面邻居）。
+- `CHAMFER`：小 plane patch（面积 ≤ 0.35 × 邻居面积中位数，且有曲面邻居）；与曲面邻居的共享边界夹角还须小于 75°，避免把垂直于槽壁的平面槽底误标为倒角。
 
 这些 patch 不参与标准 candidate，而由 5.6 的 transition curved candidate 单独处理。
 
@@ -192,6 +194,7 @@ plane 法向聚类 → 局部正交坐标系假设 → plane 表面转换到局�
 7. **端盖对驱动棱柱**（`_cap_pair_extrusion_candidates`）：槽/凹槽常只露出两个端面加少量侧壁，侧面驱动路径（≥3 侧面）无法触发。两枚**平行（≤20°，轴取两法向符号对齐后的均值以抵消拔模）、面积相近（≥0.5×）、互不相邻、轴向站位不同、投影轮廓重叠 ≥50%、且有共同平面侧壁相邻**的 plane patch 定义一个棱柱：端盖轮廓即 profile，端盖对为 caps。侧面同样须经轮廓边界一致性过滤，轴残差同样受 `maximum_error` 门槛限制；
 8. **防与 cube 重复**：矩形轮廓（原始 hull 顶点数 = 4）且关联 patch 面积占全部 plane patch 面积 > 0.8 时拒绝；此外在 `generate_primitive_candidates` 汇总后，由 `_drop_cube_covered_rectangles` 丢弃：与某个 cube candidate 的 patch 面积重叠 ≥ 0.9 的矩形 extrusion，以及**表面约一半以上落在 cube 面上（≥0.45）的端盖驱动棱柱**——大矩形实体统一交还给 cube 重建；
 9. **质量门槛**：`maximum_error=0.05`，轴残差（法向与轴的平均 |dot|）超过即拒绝——剔除把"法兰顶面 + 倒角面"混作侧壁的伪棱柱；其他拒绝规则：最大侧面积占比 > 0.95 拒绝；侧面数 ≥ 10 且非矩形且 hull 顶点数 > 8 拒绝（防止吞并多特征装配体）；拟合中的 `scipy.spatial.QhullError`（退化共面点集）按失败处理。
+10. **面片朝向一致性**：汇总候选时，逐个面片比较观测法向与拉伸体预期法向。若强正向（点积 ≥ 0.8）和强反向（≤ −0.8）的面片各占候选面积 ≥ 8%，则剔除该拉伸体。一个布尔操作无法同时把模型外表面和凹槽内壁解释为同一实体；`00140982` 中连接顶部大平面和两个六角槽底的两条伪拉伸体因此被排除，两个六角槽仍作为 SUBTRACT 拉伸体保留。
 
 **当前限制**：轮廓由凸包恢复，凹多边形会被填平，需要后续从边界环恢复有序轮廓。
 
@@ -238,6 +241,8 @@ plane 法向聚类 → 局部正交坐标系假设 → plane 表面转换到局�
 
 `confidence = exp(−12·err) · mean(max(seed_rate, 0.25))`。
 
+**向内圆角（`INNER_TORUS`）**：对单 patch 被初判为 `CYLINDER` 或 `CONE`、最佳拟合率 < 0.55、邻接高质量柱面且至少有两个邻居的区域，尝试环面拟合。要求环面误差 ≤ 0.01、管半径 ≤ `0.1·scale`、轴线与邻接柱面夹角 ≤ 8°、观测法向与环面管体外法向平均点积 < −0.8。邻接柱面半径可匹配环面主半径 `R`，也可匹配内侧半径 `R−a`（误差 ≤ `0.05R`）；若初判为 `CONE`，还要求环面误差 < 0.2 × 重新拟合的圆锥误差，以避免将真实倒角改成圆角。它表示短柱体减去圆管管体，横截面满足 `r ≤ R − √(max(0, a² − z²))`（`a` 为管半径）；轴向只覆盖观测圆角带并留极小连接余量。`00023582` 的 patch 24 初判为柱面；`00140710` 的 patch 2 初判为低质量圆锥，但其环面误差约 `5.6×10⁻⁵`，圆锥误差约 `0.0105`，支撑柱半径符合 `R−a`。该额外候选不改变原有区域扩散。
+
 ### 5.6 transition curved candidate（圆角/倒角母面）
 
 `generate_transition_curved_candidates()` 对 5.1 标记的 transition patch 拟合**带裁剪边界（clip_bounds）**的 cone/torus 母面：
@@ -272,6 +277,8 @@ plane 法向聚类 → 局部正交坐标系假设 → plane 表面转换到局�
 - cube 全部成员 patch 的顶点（容差外）**全部位于平面同侧**——若两侧都有表面证据，说明盒子合法地越过该平面（如插入另一体的 union 重叠），不裁剪。
 
 满足则把 `clip_bounds`（初值为 cube 自身 AABB）在该轴向上收紧到平面位置。CUBE 的 `primitive_contains`/`primitive_bounds`/OpenSCAD 输出（`intersection() { cube; clip_box; }`）均支持 `clip_bounds`，与 transition 的裁剪共用 `_clip_shape`。
+
+**浅角度切削面**：`_attach_oblique_cube_faces()` 在区域扩散完成后检查 cube 相邻、尚未归属的平面 patch。若其法向与 cube 某轴相差 2°–20°、与至少两个 cube 成员相邻、整个 patch 位于 cube 包围体内、cube 已有观测点均在保留半空间，且平面只切去 `5e-4·scale` 到 `0.05·scale` 深度的角部，则把该 patch 记为 cube 的 `clip_planes`。CSG 查询对每个平面执行半空间约束，OpenSCAD 使用足够大的旋转盒与 cube 求交；候选的 `patch_ids` 纳入该斜面。这样保留原有正交区域扩散，再处理其忽略的浅斜面。`00024448` 的 8 个约 10° 斜面分别裁剪四个 cube，每个 cube 两面。
 
 ### 5.10 通用几何查询
 
@@ -312,6 +319,7 @@ plane 法向聚类 → 局部正交坐标系假设 → plane 表面转换到局�
 - 新 candidate 不得与已选 candidate 共享 patch；
 - ADD 可直接加入；
 - SUBTRACT 必须被当前已选 ADD 几何支持：采样点被 ADD 覆盖 ≥ 0.9，或 cutter bbox 被某 ADD bbox 完整包含。
+- 对凹圆角的 `CYLINDER` 刀具，若观测法向强烈朝内（orientation < −0.8）、至少 30% 的采样点落在已选 ADD 内、且其面片与这些 ADD 的面片相邻，也允许加入。圆角曲面可跨越两个母实体的拟合范围，不能要求其整个表面由其中一个母实体覆盖；这一放宽只用于此类有真实交叠和邻接证据的圆柱刀具。
 
 这防止"减去一个与主体完全不相交的大球/柱"这类不改变几何但结构错误的结果。
 
@@ -363,6 +371,18 @@ INTERSECTION 不是单 candidate 的属性，而是**多个 ADD candidate 之间
 3. transition candidate（clip 的 torus/cone）与其支撑 base primitive 组成 INTERSECTION 项并入 base——但若 clip 后的 transition 与支撑的包围盒**无正体积重叠**（例如恰好卡在两个 base 之间的轮缘带），求交会将其抹除，此时改为独立 ADD 项；
 4. 多个 cutter 先组成 UNION，再生成 `DIFFERENCE(base, cutter_union)`；
 5. **Additive restoration**：检查 additive candidate 表面是否被 cutter 大量覆盖（≥ 0.9），若是则将其从 base 移出，在 difference 之外重新 UNION 回去——即 `(base − cutters) + restored_parts` 而非 `base − cutters − parts`。覆盖率只在候选的**曲面侧壁点**上采样（不含附着的平面端盖点，端盖属于周围基体会稀释比例）。针对同轴 cylinder 的特殊情形（同轴 8° 内、cutter 半径更大、覆盖率 ∈ [0.5, 0.9)），还会把 cutter extent 重设为 additive candidate 端点在 cutter 轴上的投影，使本应等高的两圆柱高度对齐。
+
+**局部布尔修正**：槽底中心盒刀具与其记录的相邻拉伸刀具在底部相接，但拉伸轮廓的内边界可能随高度外移。`_stitch_pocket_cutters` 只把这些已选刀具的内侧轮廓延伸到盒刀具侧面，并设置 `1e-4·scale` 的重叠；不改变可见外轮廓。`_overlap_coaxial_cutters` 对同轴、端面相接的阶梯孔圆柱刀具设置 `1e-5·scale` 的轴向重叠，消除导出布尔计算中的零厚度接缝。两者只改 CSG IR，不更改候选的 patch 归属。
+
+**内凹圆柱圆角支撑体**：`_concave_cylinder_fillet_supports` 在所选 SUBTRACT 圆柱与所选 ADD 凸圆柱、ADD cube 的顶面均有面片邻接时，检查两圆柱共轴（≤1°）、截面圆外切（圆心距与两半径之和误差 ≤ `5e-4·scale`）、顶面经过凸圆柱轴、凹圆柱轴位于顶面外侧一个凹圆柱半径处。满足条件才计算两圆柱切点，并沿轴向、切点到凹圆柱轴的平面方向、顶面到凹圆柱轴的法向范围形成局部旋转盒；盒向相邻实体内重叠 `1e-4·scale`，但不越过支撑平面的轴向边界。至少 90% 的凹圆柱观测面片采样点须落入盒内。盒并入 ADD base 后，仍由原 SUBTRACT 圆柱裁剪；仅增加已验证的圆角母体积，不修改区域扩散、原候选及 patch 归属。
+
+**加法实体接缝**：`_bridge_additive_cone_seams` 对同轴、半径在接缝处相等、几乎端面相接的圆锥和圆柱，将圆锥向圆柱内延长 `1e-5·scale`，并与圆柱半径约束求交；因此得到正体积重叠，却不在外侧留下径向凸边。`_join_inward_torus_supports` 对内圆角的内侧半径与支撑柱半径相等的情形，去掉圆角候选伸到柱体外端的微小轴向 padding，同时让支撑柱伸入圆角 `1e-4·scale`。这些操作只调整所选 CSG IR。`00141097` 的三处圆锥/圆柱接缝及两处圆角/柱体接缝按此规则处理，但此前只检查了加法体，未检查阶梯孔在局部法兰面上的刀具终点，因此仍可能出现薄封口。
+
+**贯通孔端面**：当减法圆柱的观测侧壁在其轴向同时到达模型两端（误差 ≤ `1e-4·scale`），`_extend_through_hole_cutters` 将该刀具越过两端各 `5e-4·scale`。盲孔不满足双端条件，深度不变。`00025063` 的圆角修正把主体端面延长约 `1e-4·scale`，而原中心孔刀具仍止于观测端面，两端因此形成极薄封口；48–128 分辨率的 voxel IoU 约为 1 也无法揭示这一点。端面处的精确 `csg_contains` 采样现用于测试孔确实贯通。
+
+**局部法兰孔口**：`_extend_cutters_at_additive_mouths` 查找减法圆柱侧壁的相邻平面；该平面须属于已选 ADD 体、法向沿刀具轴朝外、平面轴向站位与刀具端点相差不超过 `1e-4·scale`。满足条件时，仅在 CSG IR 中把对应端点向外延长 `5e-4·scale`。这覆盖位于模型整体包围盒内部的法兰孔口，同时保留由 SUBTRACT 面片表示的阶梯孔台肩和盲孔底面。`00141097` 的三个浅孔刀具越过 x≈30.1625 的法兰面，三个深孔刀具越过 x≈42.8625 的法兰面；两段刀具在 x≈36.5125 已有约 0.0017 的轴向交叠。
+
+**端部锥形圆角约束**：若 ADD cone 与 ADD 多边形拉伸体共轴、图上相邻，且观测 cone 顶点投影均位于拉伸轮廓内或距其边界不超过 `1e-4·scale`，`_apply_conical_end_constraints` 将拉伸体沿轴延长到观测端面，并将 cone 向主体内部延长到其半径足以覆盖另一端的轮廓。之后以拉伸体和各端 cone 的 `INTERSECTION` 形成实体，每个端部面片各对应一个约束曲面。此前仅将 cone 与主体求并，即使限制了 cone 的侧向范围，完整拉伸体仍会填满本应由圆角削去的端部棱角；candidate 层的 surface coverage 无法发现这个布尔错误。
 
 CSG IR 节点格式：
 
@@ -422,11 +442,12 @@ EMPTY:         false
 |---|---|
 | UNION / DIFFERENCE / INTERSECTION | `union(){}` / `difference(){}` / `intersection(){}` 递归 |
 | EMPTY | 注释行 |
-| CUBE | `translate(center) rotate(euler_xyz_degrees) cube(size, center=true)` |
+| CUBE | `translate(center) rotate(euler_xyz_degrees) cube(size, center=true)`；有 `clip_planes` 时与各平面半空间旋转盒求交 |
 | SPHERE | `translate(center) sphere(r)` |
 | CYLINDER | `translate(起点) rotate(a, v) cylinder(h, r)` |
 | CONE | `translate rotate cylinder(h, r1, r2)`（半径 = `max(0, extent)·tan(angle)`） |
 | TORUS | `translate rotate rotate_extrude() translate([major,0,0]) circle(r=minor)` |
+| INNER_TORUS | `difference() { cylinder(r=major); torus(major, minor); }`（有限轴向） |
 | EXTRUSION / SPLINE_EXTRUSION | `multmatrix(4×4) linear_extrude(height) polygon(points)` |
 
 **轴旋转（`_axis_rotation`）**：把 OpenSCAD 默认 Z 轴旋转到 candidate 轴——角取 `acos(clip(z·axis))`、轴取 `cross(z, axis)`，平行/反平行退化时用固定 fallback 轴。
@@ -443,7 +464,7 @@ Extrusion 的局部 X/Y 基与拉伸轴组成 4×4 变换矩阵，因此拉伸�
 
 纯 facade（77 行），实现全部位于 `csg/csg_core/`，保持 notebook 与旧调用方式不变。
 
-函数式接口：`generate_primitive_candidates`、`classify_boolean_operations`、`generate_boolean_hypotheses`、`infer_intersection_groups`、`reconstruct_csg_tree`、`build_csg_ir`、`validate_csg`、`csg_contains`、`csg_to_openscad`，以及各单体生成函数（`generate_cube_candidates`、`generate_extrusion_candidates`、`generate_spline_extrusion_candidates`、`generate_curved_candidates`、`classify_transition_patches`、`generate_transition_curved_candidates`、`generate_planar_notch_cutters`）与查询函数（`primitive_bounds`、`primitive_contains`）。
+函数式接口：`generate_primitive_candidates`、`classify_boolean_operations`、`generate_boolean_hypotheses`、`infer_intersection_groups`、`reconstruct_csg_tree`、`build_csg_ir`、`validate_csg`、`csg_contains`、`csg_to_openscad`，以及各单体生成函数（`generate_cube_candidates`、`generate_extrusion_candidates`、`generate_spline_extrusion_candidates`、`generate_curved_candidates`、`generate_inner_torus_candidates`、`classify_transition_patches`、`generate_transition_curved_candidates`、`generate_planar_notch_cutters`、`generate_pocket_floor_cutters`）与查询函数（`primitive_bounds`、`primitive_contains`）。
 
 类接口：`PrimitiveCandidateGenerator`、`PrimitiveFitter`、`BooleanCSGReconstructor`、`CSGValidator`、`OpenSCADExporter`。
 
@@ -533,6 +554,20 @@ PrimitiveCandidate(
 `00024792_...` 含 66 个 patch：实测预处理约 12 秒，候选生成约 10 秒，验证约 1 秒。逐 patch 的 cone 拟合及多组 curved candidate 的非线性最小二乘仍是主要计算量；在无 GPU 的 CPU 环境下，大量窄小曲面 patch 会放大此成本。这个样例选择 55 个 primitive，`patch_coverage=1.0` 但 `search_score≈−0.228`，说明覆盖率优先的 beam search 可以用许多局部 primitive 拼满面片，却无法保证简洁的 CAD 结构。高体素 IoU 也不能单独证明拓扑和参数关系正确。
 
 回归测试目前仍有四处已存在或单面修复后暴露的几何期望差异：`00025611` 的 torus 候选、`00023582` 的 extrusion 最终选择、`00140553` 的第四个 cube，以及 `00025183` 的覆盖率阈值。后三项使用修改前的 candidate cone 拟合也能复现；这些属于候选/搜索质量问题，不能靠体素验证加速来修复。一般失败还可能来自分割面跨 primitive、凹形轮廓被凸包填平、过渡面被错误归类，以及仅按 patch coverage 搜索而未优化几何一致性。
+
+### 14.3 圆角、倒角与薄壁修复的实测结果
+
+| 模型 | 修复前 surface / voxel IoU | 修复后 surface / voxel IoU | 主要原因与处理 |
+|---|---:|---:|---|
+| `00024792` 螺丝十字槽 | 1.000 / 0.9867 | 1.000 / 0.9934 | 四个渐变槽刀具与固定宽度中心刀具在上部留缝；只补齐已识别槽臂的内接缝 |
+| `00024448` 浅斜面 cube | 0.8581 / 0.9678 | 1.000 / 1.0000 | 四个 cube 各有两个约 10° 斜切平面被原正交分组忽略；在候选生成后加入平面半空间裁剪，8 个斜面法向两侧取样均正确 |
+| `00023582` 向内圆角 | 0.9483 / 0.9661 | 1.000 / 0.9970 | patch 24 是内凹环面而非柱面；新增 `INNER_TORUS`，并取消把平面槽底误标为倒角 |
+| `00140710` 轴肩圆角 | 1.000 / 0.99865 | 1.000 / 0.99976 | patch 2 的内凹环面被初判为低质量圆锥；允许 `R−a` 与相邻柱面匹配，并要求环面误差显著优于圆锥；圆角面片法向两侧 0.005 距离取样从约 87%/43% 改善至 100%/100% |
+| `00025063` 螺帽两端圆角及中心孔 | 1.000 / 0.9458 | 1.000 / 1.0000 | 两端曲面约束六边形主体，贯通孔刀具越过两端，消除体素评估遗漏的薄封口；96/128 分辨率下 voxel IoU 均约 0.99995，端面轴线上精确取样为空 |
+| `00141097` 阶梯孔与薄片 | 1.000 / 0.9991 | 1.000 / 0.9991 | 加法体接缝修正后，进一步让六个减法圆柱越过各自局部法兰孔口；该薄封口小于默认体素采样尺度，IoU 不变，另用刀具端点测试验证贯穿 |
+| `00140982` 六角凹槽与顶部圆角 | 0.9361 / 0.5583 | 0.9087 / 1.0000 | 拒绝混合外表面和槽底的伪 ADD 拉伸体；恢复主体、两个六角减法槽，并在切触条件成立时给内凹圆柱圆角增加局部母体积 |
+
+这些数据采用默认 `voxel_resolution=48` 的近似验证，不能证明所有更细尺度处完全一致。96 分辨率、最多 100 万体素复核时，`00140982` / `00141097` 的 IoU 分别为 0.99801 / 0.99930。`00140982` 的 surface coverage 是**候选关联面片面积比**，不是重建表面的几何距离：剩余未关联的 patch 6/16 是贯穿主盒与上方圆柱的复合侧端面，单个候选无法认领整片。用各面片三角形中心、沿法向内外各 `0.001·model_scale` 的精确布尔占据测试，圆角 patch 7 的边界正确率由约 0.255 升至 1.000，整模型面积加权边界正确率为 1.000。不能仅把复合侧端面强行挂到盒或圆柱候选上提高关联指标。
 
 ## 15. 备注：与 CSG 无关的相邻代码
 

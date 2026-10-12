@@ -1799,7 +1799,8 @@ def generate_inner_torus_candidates(results, graph, maximum_error=0.01):
     model_scale = max(float(np.linalg.norm(np.ptp(model_points, axis=0))), EPSILON)
     candidates = []
     for patch_id, result in lookup.items():
-        if str(result.get("type", "")).upper() != "CYLINDER":
+        seed_type = str(result.get("type", "")).upper()
+        if seed_type not in {"CYLINDER", "CONE"}:
             continue
         if float(result.get("fit_rate", 0.0)) >= 0.55 or len(neighbors.get(patch_id, {})) < 2:
             continue
@@ -1831,6 +1832,15 @@ def generate_inner_torus_candidates(results, graph, maximum_error=0.01):
             or minor > 0.1 * model_scale
         ):
             continue
+        if seed_type == "CONE":
+            # A genuine conical chamfer may be imperfectly segmented. Only
+            # replace it when the inward torus is substantially more accurate.
+            try:
+                _, cone_error = fit_cone(points, normals)
+            except (ValueError, np.linalg.LinAlgError, RuntimeError):
+                continue
+            if not np.isfinite(cone_error) or error >= 0.2 * cone_error:
+                continue
         matching_support = []
         for adjacent in support_ids:
             _, seed = _seed_fit(lookup[adjacent], "CYLINDER")
@@ -1838,7 +1848,10 @@ def generate_inner_torus_candidates(results, graph, maximum_error=0.01):
             if (
                 support_axis is not None
                 and abs(float(np.dot(axis, support_axis))) >= np.cos(np.deg2rad(8.0))
-                and abs(float(seed[6]) - major) <= 0.05 * major
+                and (
+                    abs(float(seed[6]) - major) <= 0.05 * major
+                    or abs(float(seed[6]) - (major - minor)) <= 0.05 * major
+                )
             ):
                 matching_support.append(adjacent)
         if not matching_support:
@@ -2610,6 +2623,75 @@ def _truncate_cubes_at_boundary_planes(candidates, results, graph, min_plane_fit
     return candidates
 
 
+def _attach_oblique_cube_faces(candidates, results, graph):
+    """Keep shallow planar cuts on an otherwise orthogonal box candidate."""
+    lookup = _result_lookup(results)
+    neighbors = _aggregated_graph(graph)
+    model_points = np.vstack(
+        [np.asarray(result["mesh"].vertices, dtype=float) for result in results]
+    )
+    model_scale = max(float(np.linalg.norm(np.ptp(model_points, axis=0))), EPSILON)
+    tolerance = max(1e-4 * model_scale, 1e-8)
+    smallest_cut = max(5e-4 * model_scale, tolerance)
+    angle_min = np.cos(np.deg2rad(2.0))
+    angle_max = np.cos(np.deg2rad(20.0))
+    corners = np.asarray(list(itertools.product((-1.0, 1.0), repeat=3)))
+    for candidate in candidates:
+        if candidate.primitive_type != "CUBE":
+            continue
+        member = set(candidate.patch_ids)
+        center = np.asarray(candidate.parameters["center"], dtype=float)
+        rotation = np.asarray(candidate.parameters["rotation"], dtype=float)
+        half_size = np.asarray(candidate.parameters["size"], dtype=float) / 2.0
+        box_corners = center + (corners * half_size) @ rotation.T
+        member_points = np.vstack(
+            [np.asarray(lookup[patch_id]["mesh"].vertices, dtype=float) for patch_id in member]
+        )
+        adjacent = {
+            patch_id
+            for member_id in member
+            for patch_id in neighbors.get(member_id, {})
+            if patch_id not in member and patch_id in lookup
+        }
+        clips = []
+        for patch_id in sorted(adjacent):
+            shared = len(member.intersection(neighbors.get(patch_id, {})))
+            if shared < 2:
+                continue
+            result = lookup[patch_id]
+            rate, plane = _seed_fit(result, "PLANE")
+            if rate < 0.8 or plane.size < 4:
+                continue
+            normal = _normalize(plane[:3])
+            if normal is None:
+                continue
+            alignment = float(np.max(np.abs(normal @ rotation)))
+            if not (angle_max <= alignment < angle_min):
+                continue
+            patch_points = np.asarray(result["mesh"].vertices, dtype=float)
+            local = (patch_points - center) @ rotation
+            if np.any(np.abs(local) > half_size + tolerance):
+                continue
+            point = patch_points.mean(axis=0)
+            if np.dot(center - point, normal) > 0.0:
+                normal = -normal
+            member_signed = (member_points - point) @ normal
+            if np.mean(member_signed > tolerance) > 0.005:
+                continue
+            corner_signed = (box_corners - point) @ normal
+            cut_depth = float(corner_signed.max())
+            if not (smallest_cut < cut_depth <= 0.05 * model_scale):
+                continue
+            clips.append(
+                {"patch_id": patch_id, "normal": normal.tolist(), "point": point.tolist()}
+            )
+        if clips:
+            candidate.parameters["clip_planes"] = clips
+            candidate.patch_ids = sorted(member | {clip["patch_id"] for clip in clips})
+            candidate.metadata["oblique_faces"] = [clip["patch_id"] for clip in clips]
+    return candidates
+
+
 def generate_pocket_floor_cutters(results, graph, extrusion_candidates, min_plane_fit_rate=0.8):
     """Recover the central void enclosed by groove prisms around a floor.
 
@@ -2905,6 +2987,43 @@ def generate_planar_notch_cutters(results, graph, cylinder_candidates, min_plane
     return cutters
 
 
+def _filter_mixed_orientation_extrusions(candidates, results):
+    """Discard prisms that combine exterior faces with inward pocket faces.
+
+    Such a prism can fit a large top plane and two pocket floors at once, but
+    no single ADD or SUBTRACT operation can explain their opposite winding.
+    Area weighting keeps small fitting noise from vetoing a valid extrusion.
+    """
+    lookup = _result_lookup(results)
+    filtered = []
+    for candidate in candidates:
+        if candidate.primitive_type not in {"EXTRUSION", "SPLINE_EXTRUSION"}:
+            filtered.append(candidate)
+            continue
+        positive_area = negative_area = total_area = 0.0
+        for patch_id in candidate.patch_ids:
+            mesh = lookup[patch_id]["mesh"]
+            centers = mesh.triangles_center
+            normals = mesh.face_normals
+            if len(centers) > 128:
+                indices = np.linspace(0, len(centers) - 1, 128).astype(int)
+                centers = centers[indices]
+                normals = normals[indices]
+            predicted = _primitive_normals(
+                candidate, centers, np.full(len(centers), patch_id, dtype=int)
+            )
+            alignment = float(np.mean(np.sum(normals * predicted, axis=1)))
+            area = float(lookup[patch_id].get("area", mesh.area))
+            total_area += area
+            if alignment >= 0.8:
+                positive_area += area
+            elif alignment <= -0.8:
+                negative_area += area
+        if min(positive_area, negative_area) < 0.08 * total_area:
+            filtered.append(candidate)
+    return filtered
+
+
 def generate_primitive_candidates(
     results,
     graph,
@@ -2933,6 +3052,8 @@ def generate_primitive_candidates(
     candidates = _drop_cube_covered_rectangles(candidates, results)
     candidates.extend(generate_pocket_floor_cutters(results, graph, candidates))
     _truncate_cubes_at_boundary_planes(candidates, results, graph)
+    _attach_oblique_cube_faces(candidates, results, graph)
+    candidates = _filter_mixed_orientation_extrusions(candidates, results)
     unique_candidates = {}
     for candidate in candidates:
         key = (candidate.primitive_type, tuple(candidate.patch_ids), bool(candidate.metadata.get("transition")))
@@ -3027,7 +3148,11 @@ def _primitive_normals(candidate, points, point_patch_ids=None):
         axes = np.argmin(distance, axis=1)
         local_normals = np.zeros_like(local)
         local_normals[np.arange(len(points)), axes] = np.sign(local[np.arange(len(points)), axes])
-        return local_normals @ rotation.T
+        normals = local_normals @ rotation.T
+        if point_patch_ids is not None:
+            for clip in parameters.get("clip_planes", []):
+                normals[np.asarray(point_patch_ids) == clip["patch_id"]] = clip["normal"]
+        return normals
     if primitive_type == "SPHERE":
         vectors = points - np.asarray(parameters["center"])
         return vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), EPSILON)
@@ -3119,7 +3244,12 @@ def primitive_contains(operation, parameters, points, tolerance=EPSILON):
         rotation = np.asarray(parameters["rotation"])
         half_size = np.asarray(parameters["size"]) / 2.0
         local = (points - center) @ rotation
-        return clipped(np.all(np.abs(local) <= half_size + tolerance, axis=1))
+        inside = np.all(np.abs(local) <= half_size + tolerance, axis=1)
+        for clip in parameters.get("clip_planes", []):
+            normal = np.asarray(clip["normal"], dtype=float)
+            point = np.asarray(clip["point"], dtype=float)
+            inside &= (points - point) @ normal <= tolerance
+        return clipped(inside)
     if operation == "SPHERE":
         return clipped(
             np.linalg.norm(points - np.asarray(parameters["center"]), axis=1)
@@ -3271,6 +3401,8 @@ class PrimitiveCandidateGenerator:
         candidates = _drop_cube_covered_rectangles(candidates, results)
         candidates.extend(generate_pocket_floor_cutters(results, graph, candidates))
         _truncate_cubes_at_boundary_planes(candidates, results, graph)
+        _attach_oblique_cube_faces(candidates, results, graph)
+        candidates = _filter_mixed_orientation_extrusions(candidates, results)
         candidates.sort(
             key=lambda candidate: (-candidate.confidence, candidate.fitting_error)
         )
